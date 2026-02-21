@@ -1,0 +1,2 @@
+Date,Job ID,Job Type,Severity,Shift,Location,Machine/Equipment,Machine ID,Date/Time Start,Date/Time End,Duration,JobStatus,Problem Description,Immediate Action,Root Cause,Preventive Action,Spare Parts Used,Reported By,Created At
+21-02-26,26-02-21/02,Maintenance,Low,Day-A,Plant-1,Press Machine,88-15ME-PM-001,21-02-26 10:45,21-02-26 11:30,45,Close,Press Machine malfunction,Check Press Machine power supply and repair the plug,Plug loose,Replace new plug,,Azli Mohd Hanifiah,21-02-26 22:47
