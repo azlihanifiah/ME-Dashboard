@@ -3,9 +3,10 @@ import pandas as pd
 from pathlib import Path
 import sqlite3
 from datetime import datetime, date, time
-from utils import ensure_data_directory, verify_user_qr_id, initialize_stock_log_database, log_stock_operation
+from utils import ensure_data_directory, verify_user_qr_id, initialize_stock_log_database, log_stock_operation, require_login
 
 st.set_page_config(page_title="Task Report", page_icon="🔧", layout="wide")
+require_login()
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BREAKDOWN_CSV = DATA_DIR / "BreakdownReport.csv"

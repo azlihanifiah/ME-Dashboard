@@ -9,8 +9,10 @@ from utils import (
     check_duplicate, calculate_due_date, calculate_days_left,
     calculate_status, validate_equipment_details,
     generate_acronym, log_asset_operation, get_asset_logs, initialize_log_database,
-    delete_asset_by_dept_id, verify_user_qr_id
+    delete_asset_by_dept_id, verify_user_qr_id, require_login
 )
+
+require_login()
 
 st.title("📝 Asset Editor")
 st.markdown("---")

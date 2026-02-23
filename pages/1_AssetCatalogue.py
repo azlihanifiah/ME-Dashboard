@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import re
-from utils import load_existing_data, filter_dataframe, clean_asset_database_schema
+from utils import load_existing_data, filter_dataframe, clean_asset_database_schema, require_login
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -13,6 +13,8 @@ st.set_page_config(
     page_icon="📘",
     layout="wide"
 )
+
+require_login()
 
 st.title("📘 Asset List")
 
