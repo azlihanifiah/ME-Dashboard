@@ -625,12 +625,50 @@ def stock_out_task(part_number: str, qty_used: int, performed_by: str = "", note
         conn.close()
 
 
-def delete_part(part_number):
+def delete_part(part_number: str, performed_by: str = "", note: str = ""):
+    pn = str(part_number or "").strip()
+    if not pn:
+        raise ValueError("Part Number is required")
+
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM storage WHERE part_number=?", (part_number,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT COALESCE(total_used, 0), COALESCE(total_add, 0)
+            FROM storage
+            WHERE part_number = ?
+            LIMIT 1
+            """,
+            (pn,),
+        )
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"Part not found: {pn}")
+
+        before_used = int(row[0])
+        before_add = int(row[1])
+
+        c.execute("DELETE FROM storage WHERE part_number = ?", (pn,))
+        if c.rowcount <= 0:
+            raise ValueError(f"Part not found: {pn}")
+
+        conn.commit()
+
+        log_stock_operation(
+            action="DELETE",
+            part_number=pn,
+            qty=0,
+            before_total_add=before_add,
+            after_total_add=0,
+            before_total_used=before_used,
+            after_total_used=0,
+            performed_by=performed_by,
+            source="Stock IN/OUT",
+            note=note,
+        )
+    finally:
+        conn.close()
 
 
 def load_breakdown_data() -> pd.DataFrame:
@@ -1113,25 +1151,59 @@ with tab_storage:
     st.markdown("## 📋 Existing Parts")
 
     storage_df = get_storage()
-    if not storage_df.empty:
-        storage_df = storage_df.copy()
 
-        # Available stock = total_add
-        storage_df["available"] = storage_df["total_add"].fillna(0).astype(int)
-
-        # ONLY show requested columns
-        show_cols = ["part_number", "item_name", "specification", "part_type", "usage", "available"]
-        for c in show_cols:
-            if c not in storage_df.columns:
-                storage_df[c] = ""
-
-        st.dataframe(
-            storage_df[show_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+    show_existing_table = st.toggle("Show existing parts table", value=True, key="existing_parts_show_table")
+    if not show_existing_table:
+        st.info("Existing parts table hidden.")
     else:
-        st.info("No parts in storage yet.")
+        if storage_df.empty:
+            st.info("No parts in storage yet.")
+        else:
+            storage_df = storage_df.copy()
+
+            # Available stock = total_add
+            storage_df["available"] = storage_df["total_add"].fillna(0).astype(int)
+
+            c_f1, c_f2 = st.columns([2, 1])
+            with c_f1:
+                existing_search = st.text_input(
+                    "Search parts (Part Number / Item Name / Specification)",
+                    key="existing_parts_search",
+                    placeholder="Type to filter...",
+                ).strip()
+            with c_f2:
+                show_all_parts = st.checkbox(
+                    "Show all parts",
+                    value=True,
+                    key="existing_parts_show_all",
+                    help="Untick to hide parts with 0 available stock.",
+                )
+
+            filtered_df = storage_df
+            if not show_all_parts:
+                filtered_df = filtered_df[filtered_df["available"] > 0]
+
+            if existing_search:
+                pn_match = filtered_df["part_number"].astype(str).str.contains(existing_search, case=False, na=False)
+                name_match = filtered_df.get("item_name", "").astype(str).str.contains(existing_search, case=False, na=False)
+                spec_match = filtered_df.get("specification", "").astype(str).str.contains(existing_search, case=False, na=False)
+                filtered_df = filtered_df[pn_match | name_match | spec_match]
+
+            # ONLY show requested columns
+            show_cols = ["part_number", "item_name", "specification", "part_type", "usage", "available"]
+            for c in show_cols:
+                if c not in filtered_df.columns:
+                    filtered_df[c] = ""
+
+            st.caption(f"Showing {len(filtered_df)} of {len(storage_df)} parts")
+            st.dataframe(
+                filtered_df[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.markdown("---")
+    
 
     # NEW/UPDATED: In / Out features (User/SuperUser only) with:
     # - Description entry for every IN/OUT
@@ -1147,7 +1219,7 @@ with tab_storage:
         )
 
         if not verify_regdata_level_or_show_error(verify_id, required_level="user"):
-            st.info("Verify as User/SuperUser to perform IN/OUT.")
+            st.info("User Verification to perform IN/OUT.")
         else:
             storage_df = get_storage()
             if storage_df.empty:
@@ -1245,70 +1317,130 @@ with tab_storage:
                         except Exception as e:
                             st.error(f"Stock OUT failed: {e}")
 
-    # Edit Storage Table (User/SuperUser only) - updated for total_add rule
+    # Edit + Bulk Delete in one SuperUser editor
     st.markdown("---")
-    st.markdown("#### ✏️ Edit Storage")
+    st.markdown("#### ✏️🗑️ Storage Editor  ")
+
+    if "storage_admin_verified" not in st.session_state:
+        st.session_state.storage_admin_verified = False
+    if "storage_admin_verified_by" not in st.session_state:
+        st.session_state.storage_admin_verified_by = ""
 
     with st.expander("Open editor", expanded=False):
-        editor_verify = st.text_input("Verify User ID / Scan QR", key="storage_editor_verify_id", placeholder="Enter User ID or scan QR")
-        if st.button("✅ Verify & Enable Editing", key="btn_enable_storage_editor"):
-            st.session_state.storage_editor_verified = verify_regdata_level_or_show_error(editor_verify, required_level="user")
+        admin_verify = st.text_input(
+            "Verify User ID / Scan QR",
+            key="storage_admin_verify_id",
+            placeholder="Enter User ID or scan QR",
+        )
 
-        if not st.session_state.get("storage_editor_verified", False):
-            st.info("User verification required.")
-        else:
-            df_edit = get_storage().copy()
-            df_edit["total_quantity"] = (df_edit["total_used"].astype(int) + df_edit["total_add"].astype(int)).astype(int)
-
-            edited = st.data_editor(
-                df_edit[["part_number", "item_name", "specification", "total_add", "total_used", "total_quantity", "part_type", "usage"]],
-                hide_index=True,
-                use_container_width=True,
-                disabled=["part_number", "total_quantity"],  # computed
-                column_config={
-                    "total_add": st.column_config.NumberColumn("Total Quantity (Available)", min_value=0, step=1),
-                    "total_used": st.column_config.NumberColumn("Total Used", min_value=0, step=1),
-                    "part_type": st.column_config.SelectboxColumn(
-                        "Part Type",
-                        options=[cfg["type_code"] for cfg in PART_TYPE_CONFIG.values()],
-                        required=False,
-                    ),
-                    "usage": st.column_config.TextColumn("Usage (free text)"),
-                },
-                key="storage_table_editor",
-            )
-
-            if st.button("💾 Apply Changes", type="primary", key="btn_apply_storage_changes"):
-                errors = []
-                for _, r in edited.iterrows():
-                    pn = str(r["part_number"]).strip()
-                    try:
-                        item = str(r["item_name"]).strip()
-                        spec = str(r["specification"]).strip()
-                        ptype = str(r["part_type"]).strip()
-                        usage = str(r.get("usage", "")).strip()
-                        total_add = int(pd.to_numeric(r["total_add"], errors="coerce"))
-                        total_used = int(pd.to_numeric(r["total_used"], errors="coerce"))
-
-                        if not pn:
-                            errors.append("Row has empty part_number (cannot update).")
-                            continue
-                        if not item:
-                            errors.append(f"{pn}: Item Name is required.")
-                            continue
-                        if total_add < 0 or total_used < 0:
-                            errors.append(f"{pn}: quantities cannot be negative.")
-                            continue
-
-                        update_storage_row(pn, item, spec, total_add, total_used, ptype, usage)
-                    except Exception as e:
-                        errors.append(f"{pn}: update failed: {e}")
-
-                if errors:
-                    st.error("Some changes were not applied:")
-                    for msg in errors[:30]:
-                        st.write(f"- {msg}")
-                    st.stop()
-
-                st.success("Storage updated.")
+        c_verify, c_reset = st.columns(2)
+        with c_verify:
+            if st.button("✅ Verify User", key="btn_enable_storage_admin", use_container_width=True):
+                if verify_regdata_level_or_show_error(admin_verify, required_level="superuser"):
+                    st.session_state.storage_admin_verified = True
+                    st.session_state.storage_admin_verified_by = str(admin_verify or "").strip()
+                else:
+                    st.session_state.storage_admin_verified = False
+                    st.session_state.storage_admin_verified_by = ""
+        with c_reset:
+            if st.button("♻️ Reset Verification", key="btn_reset_storage_admin", use_container_width=True):
+                st.session_state.storage_admin_verified = False
+                st.session_state.storage_admin_verified_by = ""
                 st.rerun()
+
+        if not st.session_state.get("storage_admin_verified", False):
+            st.info("SuperUser verification required.")
+        else:
+            st.success("SuperUser verified. You can edit rows and tick parts to remove.")
+
+            df_edit = get_storage().copy()
+            if df_edit.empty:
+                st.info("No parts in storage.")
+            else:
+                df_edit["total_quantity"] = (df_edit["total_used"].astype(int) + df_edit["total_add"].astype(int)).astype(int)
+                df_edit["Remove"] = False
+
+                edited = st.data_editor(
+                    df_edit[["Remove", "part_number", "item_name", "specification", "total_add", "total_used", "total_quantity", "part_type", "usage"]],
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=["part_number", "total_quantity"],
+                    column_config={
+                        "Remove": st.column_config.CheckboxColumn("Remove", default=False),
+                        "total_add": st.column_config.NumberColumn("Total Quantity (Available)", min_value=0, step=1),
+                        "total_used": st.column_config.NumberColumn("Total Used", min_value=0, step=1),
+                        "part_type": st.column_config.SelectboxColumn(
+                            "Part Type",
+                            options=[cfg["type_code"] for cfg in PART_TYPE_CONFIG.values()],
+                            required=False,
+                        ),
+                        "usage": st.column_config.TextColumn("Usage (free text)"),
+                    },
+                    key="storage_table_editor",
+                )
+
+                selected_pns = edited[edited["Remove"] == True]["part_number"].astype(str).str.strip().tolist()
+                st.caption(f"Selected for delete: {len(selected_pns)}")
+
+                del_note = st.text_input(
+                    "Delete Description",
+                    key="storage_delete_note",
+                    placeholder="Optional reason for deletion...",
+                )
+                confirm_delete = st.checkbox(
+                    "I confirm deleting selected parts",
+                    key="storage_delete_confirm",
+                )
+
+                if st.button("💾 Apply Changes", type="primary", key="btn_apply_storage_changes"):
+                    errors = []
+
+                    # 1) apply updates for rows not marked for delete
+                    for _, r in edited.iterrows():
+                        pn = str(r["part_number"]).strip()
+                        if bool(r.get("Remove", False)):
+                            continue
+                        try:
+                            item = str(r["item_name"]).strip()
+                            spec = str(r["specification"]).strip()
+                            ptype = str(r["part_type"]).strip()
+                            usage = str(r.get("usage", "")).strip()
+                            total_add = int(pd.to_numeric(r["total_add"], errors="coerce"))
+                            total_used = int(pd.to_numeric(r["total_used"], errors="coerce"))
+
+                            if not pn:
+                                errors.append("Row has empty part_number (cannot update).")
+                                continue
+                            if not item:
+                                errors.append(f"{pn}: Item Name is required.")
+                                continue
+                            if total_add < 0 or total_used < 0:
+                                errors.append(f"{pn}: quantities cannot be negative.")
+                                continue
+
+                            update_storage_row(pn, item, spec, total_add, total_used, ptype, usage)
+                        except Exception as e:
+                            errors.append(f"{pn}: update failed: {e}")
+
+                    # 2) apply deletes for selected rows
+                    if selected_pns and not confirm_delete:
+                        errors.append("Please confirm deleting selected parts.")
+                    else:
+                        for pn in selected_pns:
+                            try:
+                                delete_part(
+                                    part_number=pn,
+                                    performed_by=st.session_state.get("storage_admin_verified_by", ""),
+                                    note=str(del_note or "").strip(),
+                                )
+                            except Exception as e:
+                                errors.append(f"{pn}: delete failed: {e}")
+
+                    if errors:
+                        st.error("Some changes were not applied:")
+                        for msg in errors[:40]:
+                            st.write(f"- {msg}")
+                        st.stop()
+
+                    st.success("Storage changes applied.")
+                    st.rerun()

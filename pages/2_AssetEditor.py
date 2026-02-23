@@ -3,10 +3,11 @@ import pandas as pd
 from datetime import datetime, date
 from pathlib import Path
 import sqlite3
+import re
 from utils import (
     ensure_data_directory, load_existing_data, save_data,
     check_duplicate, calculate_due_date, calculate_days_left,
-    calculate_status, validate_equipment_details, generate_department_id,
+    calculate_status, validate_equipment_details,
     generate_acronym, log_asset_operation, get_asset_logs, initialize_log_database,
     delete_asset_by_dept_id, verify_user_qr_id
 )
@@ -18,8 +19,62 @@ ensure_data_directory()
 initialize_log_database()  # <-- ADD: make sure logging DB/table exists before any log write
 
 DATA_DIR = Path("data")
-IMG_DIR = DATA_DIR / "images"
+IMG_DIR = Path("images")
 IMG_DIR.mkdir(parents=True, exist_ok=True)
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _sanitize_filename_base(value: str, max_len: int = 80) -> str:
+    """Create a Windows-safe filename base (no extension)."""
+    s = str(value or "").strip().upper()
+    # Replace invalid Windows filename characters
+    s = re.sub(r'[<>:"/\\|?*]', "_", s)
+    # Replace whitespace runs with single underscore
+    s = re.sub(r"\s+", "_", s)
+    # Remove non-printable characters
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = s.strip("._ ")
+    if not s:
+        s = "ASSET"
+    return s[: int(max_len)]
+
+
+def _asset_key_prefix(department_id: str, asset_number: str) -> str:
+    """Stable prefix for identifying an asset's images (used for replace/delete)."""
+    raw = f"{str(department_id or '').strip()}_{str(asset_number or '').strip()}"
+    return _sanitize_filename_base(raw, max_len=80)
+
+
+def _asset_image_prefix(department_id: str, asset_number: str, description: str) -> str:
+    """Prefix used for naming images (includes description as requested)."""
+    key = _asset_key_prefix(department_id, asset_number)
+    desc = _sanitize_filename_base(description, max_len=80)
+    # Ensure we always have a reasonable base, even if description is empty.
+    return f"{key}_{desc}" if desc else key
+
+
+def _save_uploaded_images_replace(target_dir: Path, delete_key_prefix: str, save_prefix: str, images) -> None:
+    """Replace existing images for this asset (by delete_key_prefix) with newly uploaded ones."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear old images for this asset only
+    for old in target_dir.iterdir():
+        if not old.is_file() or old.suffix.lower() not in _IMAGE_EXTS:
+            continue
+        if old.name.upper().startswith(f"{str(delete_key_prefix or '').upper()}_"):
+            old.unlink(missing_ok=True)
+
+    base = str(save_prefix or "").strip() or "ASSET"
+    for i, f in enumerate(images, start=1):
+        ext = Path(getattr(f, "name", "") or "").suffix.lower()
+        if ext not in _IMAGE_EXTS:
+            # Fallback (shouldn't happen due to uploader restriction)
+            ext = ".png"
+        out_name = f"{base}_{i:02d}{ext}"
+        out_path = target_dir / out_name
+        with open(out_path, "wb") as out:
+            out.write(f.getbuffer())
 
 # regdata.db (access level source)
 REGDATA_DB_PATH = DATA_DIR / "regdata.db"
@@ -31,7 +86,6 @@ for k, v in {
     "show_add_form": False,
     "description": "",
     "prefix": "",
-    "acronym": "",  # <-- ADD: you set this later; prevent KeyError
     "pending_add": None,
     "pending_update": None,
     "delete_pending_qr_verify": None,
@@ -42,6 +96,75 @@ for k, v in {
         st.session_state[k] = v
 
 # ================= HELPER FUNCTIONS =================
+
+FUNCTIONAL_LOCATION_OPTIONS = [
+    "Obsolete",
+    "1006-10PE",
+    "1006-10PE-P1F0",
+    "1006-10PE-P1F0-Z001",
+    "1006-10PE-P1F1",
+    "1006-10PE-P1F1-Z001",
+    "1006-10PE-P1F2",
+    "1006-10PE-P1F2-Z001",
+    "1006-10PE-P1F2-ZP01",
+    "1006-10PE-P4F0",
+    "1006-10PE-P4F0-Z001",
+    "1006-10PE-P6F0",
+    "1006-10PE-P6F0-Z001",
+]
+
+FUNCTIONAL_LOCATION_DESCRIPTION = {
+    "Obsolete": "Obsolete / Discarded",
+    "1006-10PE": "Assembly (Production)",
+    "1006-10PE-P1F0": "Plo 62 Ground Floor",
+    "1006-10PE-P1F0-Z001": "ME General Area",
+    "1006-10PE-P1F1": "Plo 62 Floor 01",
+    "1006-10PE-P1F1-Z001": "ME General Area",
+    "1006-10PE-P1F2": "Plo 62 Floor 02",
+    "1006-10PE-P1F2-Z001": "ME General Area",
+    "1006-10PE-P1F2-ZP01": "PE General Area",
+    "1006-10PE-P4F0": "Plo 65 Ground Floor",
+    "1006-10PE-P4F0-Z001": "ME General Area",
+    "1006-10PE-P6F0": "Plo 67 Ground Floor",
+    "1006-10PE-P6F0-Z001": "ME General Area",
+}
+
+
+def _normalize_dept_code(value: str) -> str:
+    v = str(value or "").strip().upper()
+    return v
+
+
+def _normalize_item_prefix(value: str) -> str:
+    return str(value or "").strip().upper()
+
+
+def generate_department_id_add(dept_code: str, item_prefix: str, df: pd.DataFrame | None) -> str:
+    """Generate Department ID for Add flow:
+    88-{15ME/15PE}-{PREFIX}-{NNN}, where NNN runs per dept+prefix.
+    """
+    dept_code = _normalize_dept_code(dept_code)
+    item_prefix = _normalize_item_prefix(item_prefix)
+
+    if dept_code not in {"15ME", "15PE"}:
+        return ""
+    if not item_prefix:
+        return ""
+
+    pattern = re.compile(rf"^88-{re.escape(dept_code)}-{re.escape(item_prefix)}-(\\d{{3}})$", re.IGNORECASE)
+    max_n = 0
+
+    if df is not None and not df.empty and "Department ID" in df.columns:
+        for raw in df["Department ID"].dropna().astype(str).tolist():
+            m = pattern.match(raw.strip())
+            if not m:
+                continue
+            try:
+                max_n = max(max_n, int(m.group(1)))
+            except Exception:
+                continue
+
+    return f"88-{dept_code}-{item_prefix}-{(max_n + 1):03d}"
 
 def safe_index(options, value, default: int = 0) -> int:
     """Return index of value in options; otherwise default."""
@@ -59,6 +182,11 @@ def save_row_to_df(row: dict) -> dict:
     """
     out = dict(row or {})
     for k, v in list(out.items()):
+        # Uppercase all text values except Status (requirement)
+        if isinstance(v, str) and k != "Status":
+            out[k] = v.strip().upper()
+            continue
+
         # Normalize pandas NaN
         if isinstance(v, float) and pd.isna(v):
             out[k] = ""
@@ -118,17 +246,27 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     # ---- Basic details ----
     col1, col2, col3 = st.columns(3)
     with col1:
-        department = st.text_input(
-            "Department",
-            value=str(record.get("Department", "") or ""),
-            key=f"{prefix}_department",
-        )
+        if is_update:
+            department = st.text_input(
+                "Department",
+                value=str(record.get("Department", "") or ""),
+                key=f"{prefix}_department",
+            )
+        else:
+            department = st.text_input(
+                "Department (15ME / 15PE)",
+                value=str(record.get("Department", "") or ""),
+                key=f"{prefix}_department",
+                placeholder="15ME or 15PE",
+            )
+        department = _normalize_dept_code(department)
     with col2:
         desc = st.text_input(
             "Description of Asset *",
             value=str(record.get("Description of Asset", "") or ""),
             key=f"{prefix}_description",
         )
+        desc_norm = str(desc or "").strip().upper()
     with col3:
         # If empty, try auto acronym from description (but keep editable)
         default_prefix = str(record.get("Prefix", "") or "")
@@ -142,6 +280,7 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
             value=default_prefix,
             key=f"{prefix}_prefix",
         )
+        asset_prefix = _normalize_item_prefix(asset_prefix)
 
     col4, col5, col6 = st.columns(3)
     with col4:
@@ -208,15 +347,25 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     # ---- Location / assignment ----
     col13, col14 = st.columns(2)
     with col13:
-        func_loc = st.text_input(
+        existing_loc = str(record.get("Functional Location", "") or "").strip()
+        loc_options = [""] + FUNCTIONAL_LOCATION_OPTIONS
+        if existing_loc and existing_loc not in loc_options:
+            loc_options.insert(1, existing_loc)
+
+        func_loc = st.selectbox(
             "Functional Location",
-            value=str(record.get("Functional Location", "") or ""),
+            options=loc_options,
+            index=safe_index(loc_options, existing_loc, default=0),
             key=f"{prefix}_func_loc",
         )
     with col14:
+        mapped_desc = FUNCTIONAL_LOCATION_DESCRIPTION.get(str(func_loc or "").strip(), "")
+        fallback_desc = str(record.get("Functional Loc. Description", "") or record.get("Functional Location Description", "") or "").strip()
+        func_loc_desc_val = mapped_desc if mapped_desc else (fallback_desc if str(func_loc or "").strip() == existing_loc else "")
         func_loc_desc = st.text_input(
-            "Functional Location Description",
-            value=str(record.get("Functional Location Description", "") or ""),
+            "Functional Loc. Description",
+            value=func_loc_desc_val,
+            disabled=True,
             key=f"{prefix}_func_loc_desc",
         )
 
@@ -236,8 +385,8 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
         )
     with col17:
         prod_line = st.text_input(
-            "Production Line",
-            value=str(record.get("Production Line", "") or ""),
+            "Prod. Line",
+            value=str(record.get("Prod. Line", "") or record.get("Production Line", "") or ""),
             key=f"{prefix}_prod_line",
         )
 
@@ -252,7 +401,35 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
 
     due_date_val = _safe_calc_due_date(start_date_val, maint_freq) or _safe_parse_date(record.get("Due Date"), fallback=None)
     days_left_val = _safe_calc_days_left(due_date_val) if due_date_val else (record.get("Day Left", "") or "")
-    status_val = _safe_calc_status(days_left_val) if days_left_val != "" else (record.get("Status", "") or "")
+
+    # ---- Status Rules (priority order) ----
+    # 1) Functional Location == Obsolete -> Status = Obsolete
+    # 2) Day Left <= 0 -> Expired
+    # 3) Day Left < 7 -> Expired Soon
+    # 4) Functional Location == 1006-10PE -> Good
+    # 5) Functional Location other than 1006-10PE -> Idle
+    func_loc_norm = str(func_loc or "").strip()
+    record_status = str(record.get("Status", "") or "").strip()
+
+    days_left_int = None
+    try:
+        if days_left_val is not None and str(days_left_val).strip() != "":
+            days_left_int = int(float(str(days_left_val).strip()))
+    except Exception:
+        days_left_int = None
+
+    if func_loc_norm == "Obsolete":
+        status_val = "Obsolete"
+    elif days_left_int is not None and days_left_int <= 0:
+        status_val = "Expired"
+    elif days_left_int is not None and days_left_int < 7:
+        status_val = "Expired Soon"
+    elif func_loc_norm == "1006-10PE":
+        status_val = "Good"
+    elif func_loc_norm:
+        status_val = "Idle"
+    else:
+        status_val = record_status
 
     with col19:
         st.date_input(
@@ -289,11 +466,7 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     if is_update:
         dept_id = str(record.get("Department ID", "") or "")
     else:
-        try:
-            # Uses your existing helper. If it errors, fall back to a simple ID.
-            dept_id = generate_department_id(department, asset_prefix, load_existing_data())
-        except Exception:
-            dept_id = f"{department}-{asset_prefix}-{asset_number}".strip("-")
+        dept_id = generate_department_id_add(department, asset_prefix, load_existing_data())
 
     st.text_input(
         "Department ID (auto)" if not is_update else "Department ID",
@@ -302,22 +475,19 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
         key=f"{prefix}_dept_id_display",
     )
 
-    # ---- Images (Add only; Update can be enabled if you want) ----
-    images = []
-    if not is_update:
-        images = st.file_uploader(
-            "Upload Images (optional)",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"{prefix}_images",
-        ) or []
-    else:
-        st.caption("Images upload is currently available during Add only.")
+    # ---- Images (optional) ----
+    # Keep behavior simple: Add/Update can upload additional images; existing images are not removed here.
+    images = st.file_uploader(
+        "Upload Images (optional)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key=f"{prefix}_images",
+    ) or []
 
     return {
         "Department ID": dept_id,
         "Department": department,
-        "Description of Asset": desc,
+        "Description of Asset": desc_norm,
         "Prefix": asset_prefix,
         "Asset Number": asset_number,
         "SAP No.": sap_no,
@@ -329,10 +499,10 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
         "Est Value": est_value,
         "Maintenance Frequency": maint_freq,
         "Functional Location": func_loc,
-        "Functional Location Description": func_loc_desc,
+        "Functional Loc. Description": func_loc_desc_val,
         "Assign Project": assign_project,
         "Floor": floor,
-        "Production Line": prod_line,
+        "Prod. Line": prod_line,
         "Start Date": start_date_val,
         "Due Date": due_date_val if isinstance(due_date_val, date) else None,
         "Day Left": days_left_val,
@@ -532,10 +702,10 @@ if st.session_state.show_add_form:
                 "Est Value": form_vals["Est Value"],
                 "Maintenance Frequency": form_vals["Maintenance Frequency"],
                 "Functional Location": form_vals["Functional Location"],
-                "Functional Location Description": form_vals["Functional Location Description"],
+                "Functional Loc. Description": form_vals.get("Functional Loc. Description", ""),
                 "Assign Project": form_vals["Assign Project"],
                 "Floor": form_vals["Floor"],
-                "Production Line": form_vals["Production Line"],
+                "Prod. Line": form_vals.get("Prod. Line", ""),
                 "Start Date": form_vals["Start Date"],
                 "Due Date": form_vals["Due Date"],
                 "Day Left": form_vals["Day Left"],
@@ -557,17 +727,27 @@ if st.session_state.show_add_form:
                 )
                 images = form_vals.get("Images")
                 if images:
-                    folder_name = f"{row['Department ID']}_{row['Asset Number'] or 'noasset'}"
-                    target = IMG_DIR / folder_name
-                    target.mkdir(parents=True, exist_ok=True)
-                    for f in images:
-                        f_path = target / f.name
-                        with open(f_path, "wb") as out:
-                            out.write(f.getbuffer())
+                    try:
+                        delete_key = _asset_key_prefix(
+                            department_id=row.get("Department ID", ""),
+                            asset_number=row.get("Asset Number", ""),
+                        )
+                        save_prefix = _asset_image_prefix(
+                            department_id=row.get("Department ID", ""),
+                            asset_number=row.get("Asset Number", ""),
+                            description=row.get("Description of Asset", ""),
+                        )
+                        _save_uploaded_images_replace(
+                            target_dir=IMG_DIR,
+                            delete_key_prefix=delete_key,
+                            save_prefix=save_prefix,
+                            images=images,
+                        )
+                    except Exception as e:
+                        st.warning(f"Image save failed: {e}")
                 st.success(f"✅ Registered: {row['Description of Asset']} (Asset Number: {row['Asset Number']})")
                 st.session_state.pending_add = None
                 st.session_state.description = ""
-                st.session_state.acronym = ""
                 st.session_state.show_add_form = False
                 st.rerun()
         if st.button("❌ Cancel", key="cancel_add_verify"):
@@ -705,10 +885,10 @@ else:
                     "Est Value": form_vals["Est Value"],
                     "Maintenance Frequency": form_vals["Maintenance Frequency"],
                     "Functional Location": form_vals["Functional Location"],
-                    "Functional Location Description": form_vals["Functional Location Description"],
+                    "Functional Loc. Description": form_vals.get("Functional Loc. Description", ""),
                     "Assign Project": form_vals["Assign Project"],
                     "Floor": form_vals["Floor"],
-                    "Production Line": form_vals["Production Line"],
+                    "Prod. Line": form_vals.get("Prod. Line", ""),
                     "Start Date": form_vals["Start Date"],
                     "Due Date": form_vals["Due Date"],
                     "Day Left": form_vals["Day Left"],
@@ -720,6 +900,7 @@ else:
                     "record_index": record_index,
                     "record": record,
                     "updated_row": updated_row,
+                    "images": form_vals.get("Images") or [],
                 }
                 st.rerun()
 
@@ -780,6 +961,31 @@ else:
                         details=f"Type: {pend['updated_row'].get('Type', '')}, Manufacturer: {pend['updated_row'].get('Manufacturer/Supplier', '')}, Model: {pend['updated_row'].get('Model', '')}",
                         user_name=verified_username
                     )
+
+                    # Save uploaded images (if any)
+                    images = pend.get("images") or []
+                    if images:
+                        try:
+                            # Replace existing images for the ORIGINAL asset key,
+                            # then save under the UPDATED description/name.
+                            delete_key = _asset_key_prefix(
+                                department_id=pend.get("record", {}).get("Department ID", ""),
+                                asset_number=pend.get("record", {}).get("Asset Number", ""),
+                            )
+                            save_prefix = _asset_image_prefix(
+                                department_id=pend["updated_row"].get("Department ID", ""),
+                                asset_number=pend["updated_row"].get("Asset Number", ""),
+                                description=pend["updated_row"].get("Description of Asset", ""),
+                            )
+                            _save_uploaded_images_replace(
+                                target_dir=IMG_DIR,
+                                delete_key_prefix=delete_key,
+                                save_prefix=save_prefix,
+                                images=images,
+                            )
+                        except Exception as e:
+                            st.warning(f"Image save failed: {e}")
+
                     st.session_state.pending_update = None
                     st.success("✅ Asset record updated.")
                     st.rerun()

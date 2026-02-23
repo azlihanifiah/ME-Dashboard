@@ -3,7 +3,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import re
-from utils import load_existing_data, filter_dataframe
+from utils import load_existing_data, filter_dataframe, clean_asset_database_schema
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -24,11 +24,100 @@ IMAGE_FOLDER = Path("images")
 DEFAULT_IMAGE_NAME = "No Image Found"
 
 # --------------------------------------------------
+# IMAGE HELPERS (match Asset Editor naming)
+# --------------------------------------------------
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _sanitize_filename_base(value: str, max_len: int = 80) -> str:
+    """Match Asset Editor's image filename sanitation (Windows-safe)."""
+    s = str(value or "").strip().upper()
+    s = re.sub(r'[<>:"/\\|?*]', "_", s)
+    s = re.sub(r"\s+", "_", s)
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = s.strip("._ ")
+    if not s:
+        s = "ASSET"
+    return s[: int(max_len)]
+
+
+def _asset_key_prefix(department_id: str, asset_number: str) -> str:
+    raw = f"{str(department_id or '').strip()}_{str(asset_number or '').strip()}"
+    return _sanitize_filename_base(raw, max_len=80)
+
+
+def _asset_image_prefix(department_id: str, asset_number: str, description: str) -> str:
+    key = _asset_key_prefix(department_id, asset_number)
+    desc = _sanitize_filename_base(description, max_len=80)
+    return f"{key}_{desc}" if desc else key
+
+
+def _find_images_for_group(image_folder: Path, group_df: pd.DataFrame, equipment_name: str) -> list[Path]:
+    if not image_folder.exists():
+        return []
+
+    matches: list[Path] = []
+
+    # 1) Preferred (NEW): files saved by Asset Editor directly under /images
+    #    {DEPTID}_{ASSETNO}_{DESCRIPTION}_01.jpg
+    if group_df is not None and not group_df.empty:
+        for _, r in group_df.iterrows():
+            dept_id = str(r.get("Department ID", "") or "").strip()
+            asset_no = str(r.get("Asset Number", "") or "").strip()
+            desc = str(r.get("Description of Asset", equipment_name) or equipment_name).strip()
+
+            if dept_id or asset_no:
+                pref = _asset_image_prefix(dept_id, asset_no, desc)
+                for ext in _IMAGE_EXTS:
+                    matches.extend(sorted(image_folder.glob(f"{pref}_*{ext}")))
+
+                # Backward-compat: some earlier versions might save without description
+                key_pref = _asset_key_prefix(dept_id, asset_no)
+                for ext in _IMAGE_EXTS:
+                    matches.extend(sorted(image_folder.glob(f"{key_pref}_*{ext}")))
+
+    # 2) Backward-compat (OLD): normalized equipment name as a single file
+    legacy_safe = re.sub(r"[^\w\s-]", "", str(equipment_name or "").lower()).replace(" ", "_")
+    for ext in _IMAGE_EXTS:
+        p = image_folder / f"{legacy_safe}{ext}"
+        if p.exists():
+            matches.append(p)
+
+    # Deduplicate while preserving order
+    seen = set()
+    out: list[Path] = []
+    for p in matches:
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def find_equipment_image(image_folder: Path, group_df: pd.DataFrame, equipment_name: str, default_image_name: str) -> Path | None:
+    images = _find_images_for_group(image_folder, group_df, equipment_name)
+    if images:
+        return images[0]
+
+    # Fallback: default image
+    fallback_name = re.sub(r"[^\w\s-]", "", str(default_image_name or "").lower()).replace(" ", "_")
+    for ext in _IMAGE_EXTS:
+        fallback = image_folder / f"{fallback_name}{ext}"
+        if fallback.exists():
+            return fallback
+
+    return None
+
+# --------------------------------------------------
 # LOAD DATA
 # --------------------------------------------------
 if not DATA_FILE.exists():
     st.error("Database file not found.")
     st.stop()
+
+# Clean/migrate schema (idempotent)
+clean_asset_database_schema()
 
 df = pd.read_csv(DATA_FILE)
 
@@ -191,35 +280,6 @@ if filtered_equipment_list:
     st.divider()
 
     # --------------------------------------------------
-    # IMAGE SEARCH FUNCTIONS
-    # --------------------------------------------------
-    def normalize_name(name: str) -> str:
-        name = name.lower()
-        name = re.sub(r"[^\w\s-]", "", name)
-        return name.replace(" ", "_")
-
-
-    def find_equipment_image(equipment_name: str) -> Path | None:
-        if not IMAGE_FOLDER.exists():
-            return None
-
-        # 1️⃣ Try equipment image
-        safe_name = normalize_name(equipment_name)
-        for ext in (".png", ".jpg", ".jpeg", ".webp"):
-            path = IMAGE_FOLDER / f"{safe_name}{ext}"
-            if path.exists():
-                return path
-
-        # 2️⃣ Fallback: default image
-        fallback_name = normalize_name(DEFAULT_IMAGE_NAME)
-        for ext in (".png", ".jpg", ".jpeg", ".webp"):
-            fallback = IMAGE_FOLDER / f"{fallback_name}{ext}"
-            if fallback.exists():
-                return fallback
-
-        return None
-
-    # --------------------------------------------------
     # TWO-COLUMN LAYOUT
     # --------------------------------------------------
     left_col, right_col = st.columns([2, 1])
@@ -246,7 +306,7 @@ if filtered_equipment_list:
     with right_col:
         st.markdown("### Image")
 
-        image_path = find_equipment_image(current_equipment)
+        image_path = find_equipment_image(IMAGE_FOLDER, group, current_equipment, DEFAULT_IMAGE_NAME)
 
         if image_path:
             st.image(image_path, use_container_width=True)
