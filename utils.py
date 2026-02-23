@@ -12,19 +12,160 @@ DATA_FILE = Path("data/DataBase_ME_Asset.csv")
 LOG_DB_FILE = Path("data/asset_log.db")
 REGDATA_DB = Path("data/regdata.db")
 REQUIRED_COLUMNS = [
-    "Department ID", "Department", "Description of Asset", "Acronym",
-    "Asset Number", "SAP No.", "Type", "Manufacturer/Supplier", "Model",
-    "Mfg SN", "Mfg Year", "Est Value", "Maintenance Frequency",
-    "Functional Location", "Functional Location Description",
-    "Assign Project", "Floor", "Production Line", "Start Date",
-    "Due Date", "Day Left", "Status", "Remark"
+    "Prefix",
+    "Department ID",
+    "Department",
+    "Description of Asset",
+    "Asset Number",
+    "SAP No.",
+    "Type",
+    "Manufacturer/Supplier",
+    "Model",
+    "Mfg SN",
+    "Mfg Year",
+    "Est Value",
+    "Maintenance Frequency",
+    "Functional Location",
+    "Functional Loc. Description",
+    "Assign Project",
+    "Floor",
+    "Prod. Line",
+    "Start Date",
+    "Due Date",
+    "Day Left",
+    "Status",
+    "Remark",
 ]
+
+ASSET_COLUMN_RENAMES = {
+    "Functional Location Description": "Functional Loc. Description",
+    "Production Line": "Prod. Line",
+}
+
+ASSET_COLUMNS_REMOVE = {
+    "Functional Location Description",
+    "Production Line",
+    "Description of Equipment",
+    "Acronym",
+}
 
 # ======================================
 # HELPER FUNCTIONS
 # ======================================
 def ensure_data_directory() -> None:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def clean_asset_database_schema() -> bool:
+    """One-time / idempotent schema cleanup for data/DataBase_ME_Asset.csv.
+
+    - Renames old columns into new ones while preserving data:
+      - Functional Location Description -> Functional Loc. Description
+      - Production Line -> Prod. Line
+    - Removes deprecated columns:
+      - Functional Location Description, Production Line, Description of Equipment, Acronym
+    - Ensures REQUIRED_COLUMNS exist
+    """
+    ensure_data_directory()
+    if not DATA_FILE.exists():
+        return False
+
+    try:
+        df = pd.read_csv(DATA_FILE, encoding="utf-8", index_col=0)
+    except Exception:
+        return False
+
+    changed = False
+
+    # Migrate Description of Equipment -> Description of Asset (only if asset desc empty)
+    if "Description of Equipment" in df.columns:
+        if "Description of Asset" not in df.columns:
+            df["Description of Asset"] = None
+            changed = True
+
+        asset_desc = df["Description of Asset"]
+        equip_desc = df["Description of Equipment"]
+        mask = (
+            asset_desc.isna()
+            | asset_desc.astype(str).str.strip().eq("")
+        ) & (
+            equip_desc.notna()
+            & ~equip_desc.astype(str).str.strip().eq("")
+        )
+        if bool(mask.any()):
+            df.loc[mask, "Description of Asset"] = equip_desc.loc[mask]
+            changed = True
+
+    # Migrate old column values into new columns
+    for old_col, new_col in ASSET_COLUMN_RENAMES.items():
+        if old_col not in df.columns:
+            continue
+
+        if new_col not in df.columns:
+            df[new_col] = df[old_col]
+            changed = True
+            continue
+
+        new_series = df[new_col]
+        old_series = df[old_col]
+        fill_mask = (
+            new_series.isna() | new_series.astype(str).str.strip().eq("")
+        ) & (
+            old_series.notna() & ~old_series.astype(str).str.strip().eq("")
+        )
+        if bool(fill_mask.any()):
+            df.loc[fill_mask, new_col] = old_series.loc[fill_mask]
+            changed = True
+
+    # Normalize Description of Asset to uppercase
+    if "Description of Asset" in df.columns:
+        new_desc = df["Description of Asset"].fillna("").astype(str).str.strip().str.upper()
+        old_desc = df["Description of Asset"].fillna("").astype(str)
+        if not new_desc.equals(old_desc):
+            df["Description of Asset"] = new_desc
+            changed = True
+
+    # Uppercase all text cells except Status
+    # (Keep Status values as-is, per requirement)
+    for col in list(df.columns):
+        if col == "Status":
+            continue
+        try:
+            if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+                new_series = df[col].fillna("").astype(str).str.strip().str.upper()
+                old_series = df[col].fillna("").astype(str)
+                if not new_series.equals(old_series):
+                    df[col] = new_series
+                    changed = True
+        except Exception:
+            continue
+
+    # Drop deprecated columns
+    drop_cols = [c for c in ASSET_COLUMNS_REMOVE if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+        changed = True
+
+    # Ensure required columns exist
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+            changed = True
+
+    # Keep a consistent column order (required first, then any extras)
+    ordered = [c for c in REQUIRED_COLUMNS if c in df.columns] + [c for c in df.columns if c not in REQUIRED_COLUMNS]
+    if ordered != list(df.columns):
+        df = df[ordered]
+        changed = True
+
+    if changed:
+        df.to_csv(DATA_FILE, encoding="utf-8")
+        try:
+            load_existing_data.clear()
+        except Exception:
+            pass
+
+    return changed
 
 # ======================================
 # LOGGING FUNCTIONS (SQLite)
@@ -108,6 +249,11 @@ def export_logs_to_csv() -> Optional[str]:
 def load_existing_data() -> Optional[pd.DataFrame]:
     try:
         if DATA_FILE.exists():
+            # Clean schema on load (idempotent)
+            try:
+                clean_asset_database_schema()
+            except Exception:
+                pass
             df = pd.read_csv(DATA_FILE, encoding="utf-8", index_col=0)
             for col in REQUIRED_COLUMNS:
                 if col not in df.columns:
@@ -309,8 +455,9 @@ def filter_dataframe(df: pd.DataFrame, search_term: str) -> pd.DataFrame:
             "Manufacturer/Supplier", 
             "Model", 
             "Functional Location",
+            "Functional Loc. Description",
             "Assign Project", 
-            "Production Line", 
+            "Prod. Line", 
             "Status",
             "Department ID"
         ]
