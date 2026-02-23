@@ -5,9 +5,10 @@ import pandas as pd
 import plotly.express as px
 from pathlib import Path
 import re
-from utils import clean_asset_database_schema
+from utils import clean_asset_database_schema, require_login
 
 st.set_page_config(page_title="ME Dashboard", page_icon="📊", layout="wide")
+require_login()
 st.title("📊 ME Asset List")
 
 # ======================================
