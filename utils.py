@@ -4,13 +4,47 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Optional
+import hashlib
 
 # ======================================
 # CONSTANTS
 # ======================================
-DATA_FILE = Path("data/DataBase_ME_Asset.csv")
-LOG_DB_FILE = Path("data/asset_log.db")
+# Single source of truth DB
+MAIN_DB_FILE = Path("data/main_data.db")
+
+# Legacy DBs (migration only)
+LEGACY_LOG_DB_FILE = Path("data/asset_log.db")
+LEGACY_WORKSHOP_DB_FILE = Path("data/workshop.db")
+
+# Keep existing name used across the app
+LOG_DB_FILE = MAIN_DB_FILE
+
 REGDATA_DB = Path("data/regdata.db")
+
+ASSET_TABLE = "database_me_asset"
+BREAKDOWN_TABLE = "breakdown_report"
+
+BREAKDOWN_COLUMNS = [
+    "Date",
+    "Job ID",
+    "Job Type",
+    "Severity",
+    "Shift",
+    "Location",
+    "Machine/Equipment",
+    "Machine ID",
+    "Date/Time Start",
+    "Date/Time End",
+    "Duration",
+    "JobStatus",
+    "Problem Description",
+    "Immediate Action",
+    "Root Cause",
+    "Preventive Action",
+    "Spare Parts Used",
+    "Reported By",
+    "Created At",
+]
 REQUIRED_COLUMNS = [
     "Prefix",
     "Department ID",
@@ -52,120 +86,255 @@ ASSET_COLUMNS_REMOVE = {
 # ======================================
 # HELPER FUNCTIONS
 # ======================================
-def ensure_data_directory() -> None:
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+def decode_qr_payload_from_image(uploaded_file) -> Optional[str]:
+    """Decode a QR code payload from a Streamlit uploaded image.
 
-def clean_asset_database_schema() -> bool:
-    """One-time / idempotent schema cleanup for data/DataBase_ME_Asset.csv.
+    Designed for use with `st.camera_input()` or `st.file_uploader()`.
+    Returns the decoded string, or None if no QR is detected.
 
-    - Renames old columns into new ones while preserving data:
-      - Functional Location Description -> Functional Loc. Description
-      - Production Line -> Prod. Line
-    - Removes deprecated columns:
-      - Functional Location Description, Production Line, Description of Equipment, Acronym
-    - Ensures REQUIRED_COLUMNS exist
+    Requires: `opencv-python-headless` (or `opencv-python`) and `numpy`.
     """
-    ensure_data_directory()
-    if not DATA_FILE.exists():
-        return False
+
+    if uploaded_file is None:
+        return None
 
     try:
-        df = pd.read_csv(DATA_FILE, encoding="utf-8", index_col=0)
+        image_bytes = uploaded_file.getvalue()
+    except Exception:
+        try:
+            image_bytes = uploaded_file.read()
+        except Exception:
+            return None
+
+    if not image_bytes:
+        return None
+
+    try:
+        import numpy as np
+        import cv2
+    except Exception:
+        return None
+
+    try:
+        data = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+
+        detector = cv2.QRCodeDetector()
+
+        # Prefer multi-decode if available.
+        if hasattr(detector, "detectAndDecodeMulti"):
+            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+            if ok and decoded_info:
+                for val in decoded_info:
+                    val = str(val or "").strip()
+                    if val:
+                        return val
+
+        val, _, _ = detector.detectAndDecode(img)
+        val = str(val or "").strip()
+        return val or None
+    except Exception:
+        return None
+
+
+def uploaded_file_sha256(uploaded_file) -> Optional[str]:
+    """Stable digest for Streamlit UploadedFile objects to avoid re-processing the same image."""
+    if uploaded_file is None:
+        return None
+    try:
+        b = uploaded_file.getvalue()
+    except Exception:
+        try:
+            b = uploaded_file.read()
+        except Exception:
+            return None
+    if not b:
+        return None
+    return hashlib.sha256(b).hexdigest()
+
+def ensure_data_directory() -> None:
+    MAIN_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _connect_main_db() -> sqlite3.Connection:
+    ensure_data_directory()
+    conn = sqlite3.connect(MAIN_DB_FILE)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (str(table),),
+    )
+    return cur.fetchone() is not None
+
+
+def _table_row_count(conn: sqlite3.Connection, table: str) -> int:
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+        return int(cur.fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def _ensure_tables_in_main_db() -> None:
+    conn = _connect_main_db()
+    try:
+        cur = conn.cursor()
+
+        # Assets (keep schema flexible; store as TEXT like CSV import)
+        if not _table_exists(conn, ASSET_TABLE):
+            cols = ", ".join([f'"{c}" TEXT' for c in REQUIRED_COLUMNS])
+            cur.execute(f'CREATE TABLE IF NOT EXISTS "{ASSET_TABLE}" ({cols})')
+
+        # Breakdown report
+        if not _table_exists(conn, BREAKDOWN_TABLE):
+            cols = ", ".join([f'"{c}" TEXT' for c in BREAKDOWN_COLUMNS])
+            cur.execute(f'CREATE TABLE IF NOT EXISTS "{BREAKDOWN_TABLE}" ({cols})')
+
+        # Asset logs (formerly data/asset_log.db)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asset_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL,
+                department_id TEXT,
+                asset_number TEXT,
+                description TEXT,
+                details TEXT,
+                user_name TEXT DEFAULT 'System'
+            )
+            """
+        )
+
+        # Stock log (formerly data/asset_log.db)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL,
+                part_number TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                before_total_add INTEGER,
+                after_total_add INTEGER,
+                before_total_used INTEGER,
+                after_total_used INTEGER,
+                before_total_quantity INTEGER,
+                after_total_quantity INTEGER,
+                performed_by TEXT,
+                source TEXT,
+                note TEXT
+            )
+            """
+        )
+
+        # Workshop tables (formerly data/workshop.db)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS storage (
+                part_number TEXT PRIMARY KEY,
+                item_name TEXT,
+                specification TEXT,
+                total_quantity INTEGER,
+                total_used INTEGER,
+                total_add INTEGER,
+                part_type TEXT,
+                usage TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_reports (
+                job_id TEXT PRIMARY KEY,
+                date TEXT,
+                time_start TEXT,
+                time_end TEXT,
+                task_type TEXT,
+                problem TEXT,
+                immediate_action TEXT,
+                root_cause TEXT,
+                preventive_action TEXT,
+                spare_parts TEXT,
+                reported_by TEXT,
+                created_at TEXT
+            )
+            """
+        )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _migrate_legacy_into_main_db() -> None:
+    """One-time best-effort migration into main_data.db.
+
+    - If assets/breakdown tables are empty, import from CSV.
+    - If log/workshop tables are empty, copy from legacy DBs (if present).
+    """
+    _ensure_tables_in_main_db()
+    def _copy_table_if_dest_empty(dest_conn: sqlite3.Connection, *, src_db: Path, table: str) -> None:
+        if not src_db.exists():
+            return
+        if not _table_exists(dest_conn, table):
+            return
+        if _table_row_count(dest_conn, table) > 0:
+            return
+
+        try:
+            src_conn = sqlite3.connect(src_db)
+        except Exception:
+            return
+        try:
+            if not _table_exists(src_conn, table):
+                return
+            df_src = pd.read_sql_query(f'SELECT * FROM "{table}"', src_conn)
+            if df_src is None or df_src.empty:
+                return
+            # Append into existing dest table
+            df_src.to_sql(table, dest_conn, if_exists="append", index=False)
+        except Exception:
+            return
+        finally:
+            try:
+                src_conn.close()
+            except Exception:
+                pass
+
+    conn = _connect_main_db()
+    try:
+        # Legacy DBs -> main DB (best-effort, only if dest empty)
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_LOG_DB_FILE, table="asset_logs")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_LOG_DB_FILE, table="stock_log")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_WORKSHOP_DB_FILE, table="storage")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_WORKSHOP_DB_FILE, table="task_reports")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ensure_main_database() -> bool:
+    try:
+        _migrate_legacy_into_main_db()
+        return True
     except Exception:
         return False
 
-    changed = False
-
-    # Migrate Description of Equipment -> Description of Asset (only if asset desc empty)
-    if "Description of Equipment" in df.columns:
-        if "Description of Asset" not in df.columns:
-            df["Description of Asset"] = None
-            changed = True
-
-        asset_desc = df["Description of Asset"]
-        equip_desc = df["Description of Equipment"]
-        mask = (
-            asset_desc.isna()
-            | asset_desc.astype(str).str.strip().eq("")
-        ) & (
-            equip_desc.notna()
-            & ~equip_desc.astype(str).str.strip().eq("")
-        )
-        if bool(mask.any()):
-            df.loc[mask, "Description of Asset"] = equip_desc.loc[mask]
-            changed = True
-
-    # Migrate old column values into new columns
-    for old_col, new_col in ASSET_COLUMN_RENAMES.items():
-        if old_col not in df.columns:
-            continue
-
-        if new_col not in df.columns:
-            df[new_col] = df[old_col]
-            changed = True
-            continue
-
-        new_series = df[new_col]
-        old_series = df[old_col]
-        fill_mask = (
-            new_series.isna() | new_series.astype(str).str.strip().eq("")
-        ) & (
-            old_series.notna() & ~old_series.astype(str).str.strip().eq("")
-        )
-        if bool(fill_mask.any()):
-            df.loc[fill_mask, new_col] = old_series.loc[fill_mask]
-            changed = True
-
-    # Normalize Description of Asset to uppercase
-    if "Description of Asset" in df.columns:
-        new_desc = df["Description of Asset"].fillna("").astype(str).str.strip().str.upper()
-        old_desc = df["Description of Asset"].fillna("").astype(str)
-        if not new_desc.equals(old_desc):
-            df["Description of Asset"] = new_desc
-            changed = True
-
-    # Uppercase all text cells except Status
-    # (Keep Status values as-is, per requirement)
-    for col in list(df.columns):
-        if col == "Status":
-            continue
-        try:
-            if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-                new_series = df[col].fillna("").astype(str).str.strip().str.upper()
-                old_series = df[col].fillna("").astype(str)
-                if not new_series.equals(old_series):
-                    df[col] = new_series
-                    changed = True
-        except Exception:
-            continue
-
-    # Drop deprecated columns
-    drop_cols = [c for c in ASSET_COLUMNS_REMOVE if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-        changed = True
-
-    # Ensure required columns exist
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-            changed = True
-
-    # Keep a consistent column order (required first, then any extras)
-    ordered = [c for c in REQUIRED_COLUMNS if c in df.columns] + [c for c in df.columns if c not in REQUIRED_COLUMNS]
-    if ordered != list(df.columns):
-        df = df[ordered]
-        changed = True
-
-    if changed:
-        df.to_csv(DATA_FILE, encoding="utf-8")
-        try:
-            load_existing_data.clear()
-        except Exception:
-            pass
-
-    return changed
 
 # ======================================
 # LOGGING FUNCTIONS (SQLite)
@@ -173,6 +342,7 @@ def clean_asset_database_schema() -> bool:
 def initialize_log_database() -> None:
     """Initialize SQLite database for logging asset operations"""
     try:
+        ensure_main_database()
         conn = sqlite3.connect(LOG_DB_FILE)
         cursor = conn.cursor()
         cursor.execute("""
@@ -217,6 +387,7 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
 def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
     """Retrieve asset operation logs from SQLite database"""
     try:
+        ensure_main_database()
         if not LOG_DB_FILE.exists():
             return None
         
@@ -232,46 +403,64 @@ def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
         st.error(f"❌ Error retrieving logs: {str(e)}")
         return None
 
-def export_logs_to_csv() -> Optional[str]:
-    """Export logs to CSV file"""
-    try:
-        logs_df = get_asset_logs(limit=10000)
-        if logs_df is not None and not logs_df.empty:
-            csv_file = Path("data") / f"asset_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            logs_df.to_csv(csv_file, index=False)
-            return str(csv_file)
-        return None
-    except Exception as e:
-        st.error(f"❌ Error exporting logs: {str(e)}")
-        return None
-
 @st.cache_data
 def load_existing_data() -> Optional[pd.DataFrame]:
     try:
-        if DATA_FILE.exists():
-            # Clean schema on load (idempotent)
-            try:
-                clean_asset_database_schema()
-            except Exception:
-                pass
-            df = pd.read_csv(DATA_FILE, encoding="utf-8", index_col=0)
-            for col in REQUIRED_COLUMNS:
-                if col not in df.columns:
-                    df[col] = None
-            return df
-        return None
+        if not ensure_main_database():
+            return None
+        if not MAIN_DB_FILE.exists():
+            return None
+
+        conn = _connect_main_db()
+        try:
+            if not _table_exists(conn, ASSET_TABLE):
+                return None
+            df = pd.read_sql_query(f'SELECT * FROM "{ASSET_TABLE}"', conn)
+        finally:
+            conn.close()
+
+        for col in REQUIRED_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+
+        # Keep a consistent column order (required first, then any extras)
+        ordered = [c for c in REQUIRED_COLUMNS if c in df.columns] + [c for c in df.columns if c not in REQUIRED_COLUMNS]
+        df = df[ordered]
+
+        df = df.reset_index(drop=True)
+        df.index = df.index + 1
+        df.index.name = "Index"
+        return df
     except Exception as e:
         st.error(f"❌ Error reading data file: {str(e)}")
         return None
 
 def save_data(df: pd.DataFrame) -> bool:
     try:
+        if not ensure_main_database():
+            return False
+
+        if df is None or not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
         df = df.dropna(how="all")
         df = df.reset_index(drop=True)
-        df.index = df.index + 1
-        df.index.name = "Index"
-        df.to_csv(DATA_FILE, encoding="utf-8")
-        load_existing_data.clear()
+
+        # Ensure required columns exist before writing
+        for col in REQUIRED_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+
+        conn = _connect_main_db()
+        try:
+            df.to_sql(ASSET_TABLE, conn, if_exists="replace", index=False)
+            conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            load_existing_data.clear()
+        except Exception:
+            pass
         return True
     except Exception as e:
         st.error(f"❌ Error saving data: {str(e)}")
@@ -280,24 +469,78 @@ def save_data(df: pd.DataFrame) -> bool:
 def delete_asset_by_dept_id(department_id: str) -> bool:
     """Delete an asset by Department ID"""
     try:
-        # Force reload without cache
-        if DATA_FILE.exists():
-            df = pd.read_csv(DATA_FILE, encoding="utf-8", index_col=0)
-            # Filter out the asset with matching Department ID
-            df_filtered = df[df["Department ID"].astype(str) != str(department_id)]
-            
-            # If rows were actually deleted
-            if len(df_filtered) < len(df):
-                df_filtered = df_filtered.reset_index(drop=True)
-                df_filtered.index = df_filtered.index + 1
-                df_filtered.index.name = "Index"
-                df_filtered.to_csv(DATA_FILE, encoding="utf-8")
-                # Clear cache to force reload
+        if not ensure_main_database():
+            return False
+
+        dep = str(department_id or "").strip()
+        if not dep:
+            return False
+
+        conn = _connect_main_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f'DELETE FROM "{ASSET_TABLE}" WHERE TRIM(COALESCE("Department ID", "")) = ?',
+                (dep,),
+            )
+            deleted = int(cur.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+
+        if deleted > 0:
+            try:
                 load_existing_data.clear()
-                return True
-        return False
+            except Exception:
+                pass
+        return deleted > 0
     except Exception as e:
         st.error(f"❌ Error deleting asset: {str(e)}")
+        return False
+
+
+def load_breakdown_report() -> pd.DataFrame:
+    """Load breakdown report from main_data.db (breakdown_report table)."""
+    if not ensure_main_database() or not MAIN_DB_FILE.exists():
+        return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
+
+    conn = _connect_main_db()
+    try:
+        if not _table_exists(conn, BREAKDOWN_TABLE):
+            return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
+        df = pd.read_sql_query(f'SELECT * FROM "{BREAKDOWN_TABLE}"', conn)
+    except Exception:
+        return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
+    finally:
+        conn.close()
+
+    for col in BREAKDOWN_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[BREAKDOWN_COLUMNS]
+
+
+def save_breakdown_report(df: pd.DataFrame) -> bool:
+    """Replace the breakdown_report table with the provided dataframe."""
+    try:
+        if not ensure_main_database():
+            return False
+        if df is None or not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        df = df.copy()
+        for col in BREAKDOWN_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[BREAKDOWN_COLUMNS]
+
+        conn = _connect_main_db()
+        try:
+            df.to_sql(BREAKDOWN_TABLE, conn, if_exists="replace", index=False)
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except Exception:
         return False
 
 def check_duplicate(asset_number: str, existing_df: Optional[pd.DataFrame]) -> bool:
@@ -377,61 +620,6 @@ def generate_acronym(description: str, max_length: int = 5) -> str:
         for word in words:
             acronym += word[0].upper()
     return acronym[:max_length]
-
-
-# ======================================
-# REGDATA (USER) VERIFICATION – read-only
-# Manual enter: match RegData.userID  |  QR scan: match RegData.QRID
-# ======================================
-def verify_user_qr_id(value: str, is_qr_scan: bool = False) -> tuple[bool, str]:
-    """
-    Verify user from RegData table.
-    - Manual entry: match UserID
-    - QR scan: match QRID
-    Returns (True, UserID) if found, else (False, error_message)
-    """
-    value = str(value or "").strip()
-    if not value:
-        return False, "User ID / QR is required."
-
-    if not REGDATA_DB.exists():
-        return False, "regdata.db not found (data/regdata.db)."
-
-    conn = None
-    try:
-        conn = sqlite3.connect(REGDATA_DB)
-        cursor = conn.cursor()
-
-        if is_qr_scan:
-            # QR scanner → match QRID
-            cursor.execute(
-                "SELECT UserID FROM RegData WHERE QRID = ? LIMIT 1",
-                (value,)
-            )
-        else:
-            # Manual entry → match UserID
-            cursor.execute(
-                "SELECT UserID FROM RegData WHERE UserID = ? LIMIT 1",
-                (value,)
-            )
-
-        row = cursor.fetchone()
-        if not row:
-            # More helpful error depending on mode
-            return False, ("QR not found in RegData (QRID)." if is_qr_scan else "UserID not found in RegData.")
-
-        return True, str(row[0])
-
-    except sqlite3.OperationalError as e:
-        return False, f"Verification database error: {str(e)}"
-    except Exception as e:
-        return False, f"Verification error: {str(e)}"
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
 
 
 # ======================================
@@ -538,11 +726,14 @@ def lookup_regdata_user(identifier: str, *, allow_userid: bool = True, allow_qr:
 
     layout = _discover_regdata_layout(str(REGDATA_DB))
     if not layout:
-        # Fall back to the legacy hard-coded schema (RegData: UserID, QRID)
-        ok, msg = verify_user_qr_id(identifier, is_qr_scan=bool(allow_qr and not allow_userid))
-        if not ok:
-            return {"ok": False, "error": msg, "user_id": "", "display_name": "", "level_name": "", "level_rank": 0}
-        return {"ok": True, "error": "", "user_id": msg, "display_name": msg, "level_name": "", "level_rank": 1}
+        return {
+            "ok": False,
+            "error": "Unsupported regdata.db schema (no matching table/columns found).",
+            "user_id": "",
+            "display_name": "",
+            "level_name": "",
+            "level_rank": 0,
+        }
 
     table = layout["table"]
     user_col = layout.get("user_col")
@@ -648,22 +839,16 @@ def require_login(*, min_level_rank: int = 1) -> dict:
                     st.session_state[k] = defaults[k]
                 st.rerun()
         else:
-            method = st.radio(
-                "Login method",
-                options=["QR Scan", "Manual UserID"],
-                horizontal=True,
-                key="login_method",
-            )
             identifier = st.text_input(
-                "Scan QR / Enter UserID",
+                "UserID / QRID",
                 key="login_identifier",
                 placeholder="Scan QR (QRID) or type UserID...",
             )
             if st.button("Login", type="primary", use_container_width=True):
                 res = lookup_regdata_user(
                     identifier,
-                    allow_userid=(method == "Manual UserID"),
-                    allow_qr=(method == "QR Scan"),
+                    allow_userid=True,
+                    allow_qr=True,
                 )
                 if not res.get("ok"):
                     st.error(res.get("error") or "Login failed.")
@@ -736,8 +921,8 @@ def filter_dataframe(df: pd.DataFrame, search_term: str) -> pd.DataFrame:
 
 def initialize_stock_log_database() -> None:
     """
-    Creates stock_log table inside data/asset_log.db
-    (separate from existing asset logs).
+    Creates stock_log table inside data/main_data.db
+    (shared with asset logs and other app tables).
     """
     LOG_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(LOG_DB_FILE)

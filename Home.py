@@ -3,27 +3,20 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from pathlib import Path
 import re
-from utils import clean_asset_database_schema, require_login
+from utils import load_existing_data, load_breakdown_report, require_login
 
 st.set_page_config(page_title="ME Dashboard", page_icon="📊", layout="wide")
 require_login()
 st.title("📊 ME Asset List")
 
 # ======================================
-#   LOAD DATA (ASSET)
+#   LOAD DATA (ASSET) from main_data.db
 # ======================================
-csv_file = Path("data/DataBase_ME_Asset.csv")
-
-if not csv_file.exists():
-    st.error("❌ Data Base not found.")
+df = load_existing_data()
+if df is None or df.empty:
+    st.error("❌ No asset data found in main_data.db.")
     st.stop()
-
-# Clean/migrate schema (idempotent)
-clean_asset_database_schema()
-
-df = pd.read_csv(csv_file)
 
 # ======================================
 #   FILTER DATA BY STATUS
@@ -100,12 +93,12 @@ st.dataframe(Eq_Quantity, use_container_width=True, hide_index=True)
 st.markdown("---")
 st.markdown("## 🛠️ Task Report Analysis")
 
-task_csv = Path("data/BreakdownReport.csv")
-if not task_csv.exists():
-    st.info("No BreakdownReport.csv found yet (data/BreakdownReport.csv).")
-else:
-    try:
-        tdf = pd.read_csv(task_csv)
+try:
+    tdf = load_breakdown_report()
+
+    if tdf is None or tdf.empty:
+        st.info("No breakdown report data found yet.")
+    else:
 
         job_type_col = "Job Type" if "Job Type" in tdf.columns else ("Task Type" if "Task Type" in tdf.columns else None)
         duration_col = "Duration" if "Duration" in tdf.columns else None
@@ -343,5 +336,5 @@ else:
                 hide_index=True,
             )
 
-    except Exception as e:
-        st.error(f"Failed to load/plot BreakdownReport.csv: {e}")
+except Exception as e:
+    st.error(f"Failed to load/plot breakdown report data: {e}")
