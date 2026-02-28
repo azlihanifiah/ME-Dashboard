@@ -161,7 +161,28 @@ with search_col2:
     if st.button("🔍 Search", use_container_width=True, type="primary"):
         st.rerun()
 
-with st.expander("📷 Camera scan (QR)"):
+st.caption("Scan via camera or a handheld QR scanner.")
+qr_mode = st.radio(
+    "Scan method",
+    options=["QR scanner", "Camera"],
+    horizontal=True,
+    key="catalog_qr_mode",
+    label_visibility="collapsed",
+)
+
+if qr_mode == "QR scanner":
+    scanned = st.text_input(
+        "QR scanner input",
+        placeholder="Click here then scan (scanner types + Enter)",
+        key="catalog_qr_scanner",
+        label_visibility="collapsed",
+    )
+    scanned = str(scanned or "").strip()
+    if scanned and st.session_state.get("catalog_qr_scanner_last") != scanned:
+        st.session_state["catalog_qr_scanner_last"] = scanned
+        st.session_state["catalog_search_term"] = scanned
+        st.rerun()
+else:
     cam = st.camera_input("Scan QR and search", key="catalog_qr_cam")
     digest = uploaded_file_sha256(cam)
     if cam is not None and digest and st.session_state.get("catalog_qr_cam_digest") != digest:
