@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
@@ -6,11 +7,14 @@ import sqlite3
 import re
 from utils import (
     ensure_data_directory, load_existing_data, save_data,
-    check_duplicate, calculate_due_date, calculate_days_left,
+    calculate_due_date, calculate_days_left,
     calculate_status, validate_equipment_details,
     generate_acronym, log_asset_operation, get_asset_logs, initialize_log_database,
     delete_asset_by_dept_id, require_login,
     decode_qr_payload_from_image, uploaded_file_sha256,
+    get_next_department_id,
+    recompute_asset_derived_fields,
+    persist_repo_changes,
 )
 
 auth = require_login()
@@ -95,6 +99,11 @@ def _save_uploaded_images_replace(target_dir: Path, delete_key_prefix: str, save
         with open(out_path, "wb") as out:
             out.write(f.getbuffer())
 
+    try:
+        persist_repo_changes([str(target_dir)], reason=f"Update asset images: {base}")
+    except Exception:
+        pass
+
 existing_df = load_existing_data()
 
 # initialize session state keys
@@ -164,9 +173,16 @@ def generate_department_id_add(dept_code: str, item_prefix: str, df: pd.DataFram
     if not item_prefix:
         return ""
 
+    # Prefer DB-backed generator (most reliable), fallback to DataFrame scan.
+    try:
+        nxt = get_next_department_id(dept_code, item_prefix)
+        if nxt:
+            return nxt
+    except Exception:
+        pass
+
     pattern = re.compile(rf"^88-{re.escape(dept_code)}-{re.escape(item_prefix)}-(\\d{{3}})$", re.IGNORECASE)
     max_n = 0
-
     if df is not None and not df.empty and "Department ID" in df.columns:
         for raw in df["Department ID"].dropna().astype(str).tolist():
             m = pattern.match(raw.strip())
@@ -176,14 +192,16 @@ def generate_department_id_add(dept_code: str, item_prefix: str, df: pd.DataFram
                 max_n = max(max_n, int(m.group(1)))
             except Exception:
                 continue
-
     return f"88-{dept_code}-{item_prefix}-{(max_n + 1):03d}"
 
 def safe_index(options, value, default: int = 0) -> int:
     """Return index of value in options; otherwise default."""
     try:
-        if value in options:
-            return int(options.index(value))
+        # Case-insensitive match (DB values may be uppercased)
+        v_norm = str(value or "").strip().casefold()
+        for i, opt in enumerate(list(options or [])):
+            if str(opt).strip().casefold() == v_norm:
+                return int(i)
     except Exception:
         pass
     return int(default)
@@ -348,13 +366,31 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
             key=f"{prefix}_mfg_year",
         )
     with col12:
+        rec_cal_raw = str(record.get("Require Calibration", "") or "").strip().casefold()
+        cal_default = rec_cal_raw in {"yes", "y", "true", "1", "checked", "tick"}
+        cal_checked = st.checkbox(
+            "Require Calibration",
+            value=bool(cal_default),
+            key=f"{prefix}_require_cal",
+        )
+        require_cal = "Yes" if cal_checked else "No"
+        calib_required = bool(cal_checked)
+
         rec_freq = str(record.get("Maintenance Frequency", "") or "").strip()
+        if calib_required and (not rec_freq or str(rec_freq).strip().casefold() in {"none", "n/a", "na"}):
+            rec_freq = "Yearly"
         freq_idx = safe_index(freq_options, rec_freq, default=safe_index(freq_options, "None", 0))
+        if calib_required:
+            try:
+                st.session_state[f"{prefix}_maint_freq"] = freq_options[int(freq_idx)]
+            except Exception:
+                pass
         maint_freq = st.selectbox(
             "Maintenance Frequency",
             options=freq_options,
             index=freq_idx,
             key=f"{prefix}_maint_freq",
+            disabled=calib_required,
         )
 
     # ---- Location / assignment ----
@@ -412,7 +448,32 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
             key=f"{prefix}_start_date",
         )
 
-    due_date_val = _safe_calc_due_date(start_date_val, maint_freq) or _safe_parse_date(record.get("Due Date"), fallback=None)
+    # Due Date / Day Left rules:
+    # - Calibration = Yes  -> ignore maintenance frequency, but still use Due Date + Day Left.
+    #                        Due Date is editable (manual), Day Left is derived.
+    # - Calibration = No   -> use maintenance frequency to auto-calc Due Date + Day Left.
+    rec_due_date = _safe_parse_date(record.get("Due Date"), fallback=None)
+    auto_due_date = _safe_calc_due_date(start_date_val, maint_freq) or rec_due_date
+
+    with col19:
+        # Show computed due date in maintenance mode; show stored/manual in calibration mode.
+        due_date_widget_default = (rec_due_date or auto_due_date) if calib_required else (auto_due_date or rec_due_date)
+        due_date_widget_default = due_date_widget_default or date.today()
+        # When disabled (maintenance mode), force-refresh the widget value.
+        if not calib_required:
+            try:
+                st.session_state[f"{prefix}_due_date_display"] = due_date_widget_default
+            except Exception:
+                pass
+
+        due_date_widget_val = st.date_input(
+            "Due Date",
+            value=due_date_widget_default,
+            disabled=not calib_required,
+            key=f"{prefix}_due_date_display",
+        )
+
+    due_date_val = due_date_widget_val if calib_required else auto_due_date
     days_left_val = _safe_calc_days_left(due_date_val) if due_date_val else (record.get("Day Left", "") or "")
 
     # ---- Status Rules (priority order) ----
@@ -442,16 +503,14 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     elif func_loc_norm:
         status_val = "Idle"
     else:
+        # If we can't infer anything from location (blank) keep stored value.
         status_val = record_status
-
-    with col19:
-        st.date_input(
-            "Due Date (auto)",
-            value=due_date_val if isinstance(due_date_val, date) else date.today(),
-            disabled=True,
-            key=f"{prefix}_due_date_display",
-        )
     with col20:
+        # Always refresh derived/disabled display fields.
+        try:
+            st.session_state[f"{prefix}_day_left_display"] = str(days_left_val)
+        except Exception:
+            pass
         st.text_input(
             "Day Left (auto)",
             value=str(days_left_val),
@@ -462,6 +521,11 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     col21, col22 = st.columns(2)
     with col21:
         # Status is auto; show as disabled text (prevents manual inconsistency)
+        # Disabled widgets can show stale values unless we push to session_state.
+        try:
+            st.session_state[f"{prefix}_status_display"] = str(status_val) if status_val else ""
+        except Exception:
+            pass
         st.text_input(
             "Status (auto)",
             value=str(status_val) if status_val else "",
@@ -481,11 +545,17 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     else:
         dept_id = generate_department_id_add(department, asset_prefix, load_existing_data())
 
+    dept_id_key = f"{prefix}_dept_id_display"
+    try:
+        st.session_state[dept_id_key] = dept_id
+    except Exception:
+        pass
+
     st.text_input(
         "Department ID (auto)" if not is_update else "Department ID",
         value=dept_id,
         disabled=True,
-        key=f"{prefix}_dept_id_display",
+        key=dept_id_key,
     )
 
     # ---- Images (optional) ----
@@ -511,6 +581,7 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
         "Mfg Year": mfg_year,
         "Est Value": est_value,
         "Maintenance Frequency": maint_freq,
+        "Require Calibration": require_cal,
         "Functional Location": func_loc,
         "Functional Loc. Description": func_loc_desc_val,
         "Assign Project": assign_project,
@@ -536,6 +607,85 @@ def windows_confirm_delete(message: str, title: str = "Confirm delete") -> bool:
     except Exception as e:
         st.error(f"Cannot open Windows confirmation dialog. ({e})")
         return False
+
+
+def _norm_for_compare(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    if isinstance(v, (datetime, date)):
+        try:
+            return v.strftime("%Y-%m-%d")
+        except Exception:
+            return str(v)
+    s = str(v)
+    # Treat "nan"/"none" as empty for logging comparisons.
+    if s.strip().casefold() in {"nan", "none", "nat"}:
+        return ""
+    return s.strip()
+
+
+def _format_log_value(v) -> str:
+    s = _norm_for_compare(v)
+    return s if s else "(blank)"
+
+
+def _diff_asset_changes(old_row: dict, new_row: dict, *, max_items: int = 12) -> str:
+    """Create a compact change summary for UPDATE logs."""
+    ignore = {
+        # Derived/auto or non-user-editable fields (avoid noisy logs)
+        "Day Left",
+        "Functional Loc. Description",
+    }
+
+    # Prefer a stable, human-friendly order.
+    preferred = [
+        "Description of Asset",
+        "Department",
+        "Prefix",
+        "Asset Number",
+        "SAP No.",
+        "Type",
+        "Manufacturer/Supplier",
+        "Model",
+        "Mfg SN",
+        "Mfg Year",
+        "Est Value",
+        "Require Calibration",
+        "Maintenance Frequency",
+        "Start Date",
+        "Due Date",
+        "Status",
+        "Functional Location",
+        "Assign Project",
+        "Floor",
+        "Prod. Line",
+        "Remark",
+    ]
+    keys = [k for k in preferred if k in (new_row or {})]
+    for k in list((new_row or {}).keys()):
+        if k not in keys:
+            keys.append(k)
+
+    changes: list[str] = []
+    for k in keys:
+        if k in ignore:
+            continue
+        old_v = _norm_for_compare((old_row or {}).get(k, ""))
+        new_v = _norm_for_compare((new_row or {}).get(k, ""))
+        if old_v == new_v:
+            continue
+        changes.append(f"{k}: {_format_log_value(old_v)} -> {_format_log_value(new_v)}")
+
+    if not changes:
+        return "No changes detected."
+    if len(changes) > max_items:
+        shown = changes[:max_items]
+        more = len(changes) - max_items
+        shown.append(f"... (+{more} more)")
+        return "; ".join(shown)
+    return "; ".join(changes)
 
 # ================= ROW 1: ADD NEW EQUIPMENT =================
 st.markdown("### ➕ Add New Asset")
@@ -564,8 +714,6 @@ if st.session_state.show_add_form:
         )
         if not is_valid:
             st.error(error_msg)
-        elif check_duplicate(form_vals["Asset Number"], existing_df):
-            st.warning(f"⚠️ Equipment with Asset Number '{form_vals['Asset Number']}' already exists.")
         else:
             verified_username = _performed_by_label()
             row = {
@@ -582,6 +730,7 @@ if st.session_state.show_add_form:
                 "Mfg Year": form_vals["Mfg Year"],
                 "Est Value": form_vals["Est Value"],
                 "Maintenance Frequency": form_vals["Maintenance Frequency"],
+                "Require Calibration": form_vals.get("Require Calibration", "No"),
                 "Functional Location": form_vals["Functional Location"],
                 "Functional Loc. Description": form_vals.get("Functional Loc. Description", ""),
                 "Assign Project": form_vals["Assign Project"],
@@ -741,6 +890,20 @@ else:
         record_index = options[selected_label]
         record = existing_df.loc[record_index]
 
+        # Ensure Edit form always loads current DB values when the selected record changes.
+        # Streamlit widgets keep values in session_state; without this, fields/selectboxes can
+        # show stale values from a previous selection.
+        if st.session_state.get("asset_editor_loaded_record_index") != record_index:
+            st.session_state["asset_editor_loaded_record_index"] = record_index
+            # Remove any prior update-form widget state (keys are prefixed with 'upd_').
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("upd_"):
+                    try:
+                        del st.session_state[k]
+                    except Exception:
+                        pass
+            st.rerun()
+
         # IMPORTANT FIX: unique prefix per record so the form refreshes when selection changes
         upd_prefix = f"upd_{record_index}"
 
@@ -784,6 +947,12 @@ else:
                 st.error(error_msg)
             else:
                 verified_username = _performed_by_label()
+                old_row_for_log = {}
+                try:
+                    old_row_for_log = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+                except Exception:
+                    old_row_for_log = {}
+
                 updated_row = {
                     "Department ID": record.get("Department ID", ""),
                     "Department": form_vals["Department"],
@@ -798,6 +967,7 @@ else:
                     "Mfg Year": form_vals["Mfg Year"],
                     "Est Value": form_vals["Est Value"],
                     "Maintenance Frequency": form_vals["Maintenance Frequency"],
+                    "Require Calibration": form_vals.get("Require Calibration", "No"),
                     "Functional Location": form_vals["Functional Location"],
                     "Functional Loc. Description": form_vals.get("Functional Loc. Description", ""),
                     "Assign Project": form_vals["Assign Project"],
@@ -810,6 +980,7 @@ else:
                     "Remark": form_vals["Remark"]
                 }
                 updated_row = save_row_to_df(updated_row)
+                change_summary = _diff_asset_changes(old_row_for_log, updated_row)
                 existing_df = load_existing_data()
                 for k, v in updated_row.items():
                     existing_df.at[record_index, k] = v
@@ -820,7 +991,7 @@ else:
                         department_id=updated_row.get("Department ID", ""),
                         asset_number=updated_row.get("Asset Number", ""),
                         description=updated_row.get("Description of Asset", ""),
-                        details=f"Type: {updated_row.get('Type', '')}, Manufacturer: {updated_row.get('Manufacturer/Supplier', '')}, Model: {updated_row.get('Model', '')}",
+                        details=change_summary,
                         user_name=verified_username,
                     )
 
@@ -905,6 +1076,173 @@ else:
                         st.rerun()
     else:
         st.info("📝 No assets available to update.")
+
+# ================= BULK UPDATE: REQUIRE CALIBRATION =================
+st.markdown("---")
+with st.expander("🧰 Bulk Update: Require Calibration", expanded=False):
+    existing_df = load_existing_data()
+    if existing_df is None or existing_df.empty:
+        st.info("📝 No assets available.")
+    else:
+        st.caption("Tick rows to update. Tick 'Require Calibration' to set Yes; untick to set No.")
+
+        bulk_filter = st.text_input(
+            "Filter (optional)",
+            placeholder="Filter by Department ID / Asset Number / Description...",
+            key="bulk_calib_filter",
+        )
+
+        view_df = existing_df.copy()
+        if "Require Calibration" not in view_df.columns:
+            view_df["Require Calibration"] = "No"
+
+        if bulk_filter:
+            q = str(bulk_filter or "").strip()
+            if q:
+                cols = [c for c in ["Department ID", "Asset Number", "Description of Asset"] if c in view_df.columns]
+                if cols:
+                    mask = None
+                    for c in cols:
+                        m = view_df[c].astype(str).str.contains(q, case=False, na=False)
+                        mask = m if mask is None else (mask | m)
+                    if mask is not None:
+                        view_df = view_df[mask].copy()
+
+        bulk_set_yes = st.checkbox(
+            "Require Calibration (tick = Yes)",
+            value=True,
+            key="bulk_calib_set_yes",
+        )
+
+        editor_df = view_df.copy()
+        editor_df.insert(0, "Select", False)
+        editor_df.insert(1, "Row Index", editor_df.index)
+
+        show_cols = [
+            "Select",
+            "Row Index",
+            "Department ID",
+            "Asset Number",
+            "Description of Asset",
+            "Require Calibration",
+            "Maintenance Frequency",
+            "Start Date",
+            "Due Date",
+            "Day Left",
+            "Status",
+        ]
+        show_cols = [c for c in show_cols if c in editor_df.columns]
+        editor_df = editor_df[show_cols]
+
+        edited = st.data_editor(
+            editor_df,
+            hide_index=True,
+            use_container_width=True,
+            disabled=[c for c in editor_df.columns if c != "Select"],
+            key="bulk_calib_editor",
+        )
+
+        selected_row_ids = []
+        try:
+            selected_row_ids = edited.loc[edited["Select"] == True, "Row Index"].tolist()  # noqa: E712
+        except Exception:
+            selected_row_ids = []
+
+        if st.button("✅ Apply Bulk Update", type="primary", use_container_width=True, key="bulk_calib_apply"):
+            if not selected_row_ids:
+                st.warning("Select at least one row.")
+            else:
+                updated_df = load_existing_data()
+                if updated_df is None or updated_df.empty:
+                    st.error("No data loaded.")
+                    st.stop()
+
+                target_val = "Yes" if bulk_set_yes else "No"
+                changed = 0
+
+                for rid in selected_row_ids:
+                    if rid not in updated_df.index:
+                        continue
+
+                    updated_df.at[rid, "Require Calibration"] = target_val
+
+                    func_loc_norm = str(updated_df.at[rid, "Functional Location"] if "Functional Location" in updated_df.columns else "")
+                    func_loc_norm = str(func_loc_norm or "").strip()
+
+                    if bulk_set_yes:
+                        # Calibration required: only toggle the flag.
+                        # Due Date / Day Left remain as-is (typically calibration schedule).
+                        pass
+                    else:
+                        # Calibration not required: best-effort recompute due date/day left/status
+                        start_raw = updated_df.at[rid, "Start Date"] if "Start Date" in updated_df.columns else None
+                        freq_raw = updated_df.at[rid, "Maintenance Frequency"] if "Maintenance Frequency" in updated_df.columns else None
+
+                        start_dt = _safe_parse_date(start_raw, fallback=None)
+                        due_dt = _safe_calc_due_date(start_dt, str(freq_raw or "").strip()) if start_dt else None
+                        if due_dt and "Due Date" in updated_df.columns:
+                            updated_df.at[rid, "Due Date"] = due_dt.strftime("%Y-%m-%d")
+                        if "Day Left" in updated_df.columns:
+                            updated_df.at[rid, "Day Left"] = _safe_calc_days_left(due_dt) if due_dt else ""
+
+                        # Apply the same Status rules as the form (including expiry when possible).
+                        if "Status" in updated_df.columns:
+                            days_left_val = updated_df.at[rid, "Day Left"] if "Day Left" in updated_df.columns else ""
+                            days_left_int = None
+                            try:
+                                if days_left_val is not None and str(days_left_val).strip() != "":
+                                    days_left_int = int(float(str(days_left_val).strip()))
+                            except Exception:
+                                days_left_int = None
+
+                            if func_loc_norm == "Obsolete":
+                                updated_df.at[rid, "Status"] = "Obsolete"
+                            elif days_left_int is None:
+                                # Don't override existing Status when we can't derive Day Left.
+                                pass
+                            elif days_left_int is not None and days_left_int <= 0:
+                                updated_df.at[rid, "Status"] = "Expired"
+                            elif days_left_int is not None and days_left_int < 7:
+                                updated_df.at[rid, "Status"] = "Expired Soon"
+                            elif func_loc_norm == "1006-10PE":
+                                updated_df.at[rid, "Status"] = "Good"
+                            elif func_loc_norm:
+                                updated_df.at[rid, "Status"] = "Idle"
+
+                    changed += 1
+
+                if changed == 0:
+                    st.warning("No matching rows were updated.")
+                elif save_data(updated_df):
+                    st.success(f"✅ Bulk updated {changed} asset(s).")
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to save bulk updates.")
+
+# ================= MAINTENANCE: RECALCULATE DERIVED FIELDS =================
+st.markdown("---")
+with st.expander("🧹 Maintenance: Recalculate Day Left / Status", expanded=False):
+    st.caption(
+        "Fixes rows that don't match the rules (Expired / Expired Soon) by recomputing Due Date (when possible), Day Left, and Status."
+    )
+    if st.button(
+        "🔄 Recalculate and Save",
+        type="primary",
+        use_container_width=True,
+        key="asset_recalc_save",
+    ):
+        df_now = load_existing_data()
+        if df_now is None or df_now.empty:
+            st.info("📝 No assets available.")
+        else:
+            fixed = recompute_asset_derived_fields(df_now)
+            if fixed is None or fixed.empty:
+                st.warning("No data to update.")
+            elif save_data(fixed):
+                st.success("✅ Recalculated and saved derived fields for all assets.")
+                st.rerun()
+            else:
+                st.error("❌ Failed to save recalculated data.")
 
 # ================= DOWNLOAD CSV BUTTON =================
 st.markdown("---")

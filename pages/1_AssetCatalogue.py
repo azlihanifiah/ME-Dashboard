@@ -125,6 +125,7 @@ df = load_existing_data()
 if df is None or df.empty:
     st.error("No asset data found in main_data.db.")
     st.stop()
+    raise SystemExit
 
 # Required columns
 required_cols = {
@@ -137,6 +138,7 @@ missing = required_cols - set(df.columns)
 if missing:
     st.error(f"Missing columns in asset database: {', '.join(missing)}")
     st.stop()
+    raise SystemExit
 
 # Remove empty equipment names
 df = df.dropna(subset=["Description of Asset"])
@@ -144,6 +146,7 @@ df = df.dropna(subset=["Description of Asset"])
 if df.empty:
     st.warning("No equipment records found.")
     st.stop()
+    raise SystemExit
 
 # --------------------------------------------------
 # SEARCH BAR
@@ -197,18 +200,95 @@ else:
 st.markdown("---")
 
 # --------------------------------------------------
-# FILTER DATA BASED ON SEARCH
+# FILTER DATA BASED ON SEARCH + COLUMN FILTERS
 # --------------------------------------------------
 existing_df = df
 
+
+def _safe_filter_key(col: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(col or ""))
+    return f"catalog_filter_vals_{safe}"
+
+
+def _safe_filter_search_key(col: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(col or ""))
+    return f"catalog_filter_search_{safe}"
+
+
+with st.expander("🔎 Filters", expanded=False):
+    filterable_cols = [c for c in existing_df.columns]
+
+    if st.button("Clear filters", use_container_width=True, key="catalog_clear_filters"):
+        st.session_state["catalog_filter_columns"] = []
+        for k in list(st.session_state.keys()):
+            if str(k).startswith("catalog_filter_vals_") or str(k).startswith("catalog_filter_search_"):
+                try:
+                    del st.session_state[k]
+                except Exception:
+                    pass
+        st.rerun()
+
+    selected_filter_cols = st.multiselect(
+        "Filter by column",
+        options=sorted(filterable_cols),
+        key="catalog_filter_columns",
+        placeholder="Select one or more columns",
+    )
+
+    for col in selected_filter_cols:
+        ser = existing_df[col] if col in existing_df.columns else pd.Series([], dtype="object")
+        uniq = (
+            ser.dropna()
+            .astype(str)
+            .map(lambda x: x.strip())
+            .loc[lambda s: s != ""]
+            .unique()
+            .tolist()
+        )
+        uniq = sorted(uniq)
+
+        # If there are too many values, allow searching within the value list.
+        if len(uniq) > 300:
+            st.caption(f"{col}: {len(uniq)} values (showing up to 300; use search)")
+            needle = st.text_input(
+                f"Search values in {col}",
+                key=_safe_filter_search_key(col),
+                placeholder="Type to narrow the list",
+            )
+            if needle:
+                n = str(needle).strip().casefold()
+                uniq = [u for u in uniq if n in str(u).casefold()][:300]
+            else:
+                uniq = uniq[:300]
+
+        st.multiselect(
+            col,
+            options=uniq,
+            key=_safe_filter_key(col),
+            placeholder="Select value(s)",
+        )
+
 if existing_df is not None and not existing_df.empty:
     filtered_df = filter_dataframe(existing_df, search_term) if search_term else existing_df.copy()
-    
-    # Update equipment list based on search results
-    if search_term and not filtered_df.empty:
-        filtered_equipment_list = sorted(filtered_df["Description of Asset"].unique())
-    else:
-        filtered_equipment_list = sorted(df["Description of Asset"].unique())
+
+    # Apply column filters (exact match on selected values).
+    selected_filter_cols = st.session_state.get("catalog_filter_columns", []) or []
+    for col in selected_filter_cols:
+        if col not in filtered_df.columns:
+            continue
+        selected_vals = st.session_state.get(_safe_filter_key(col), []) or []
+        selected_vals = [str(v).strip() for v in selected_vals if str(v).strip() != ""]
+        if not selected_vals:
+            continue
+
+        s = filtered_df[col].astype(str).map(lambda x: x.strip())
+        filtered_df = filtered_df[s.isin(selected_vals)].copy()
+
+    filtered_equipment_list = (
+        sorted(filtered_df["Description of Asset"].dropna().unique())
+        if (filtered_df is not None and not filtered_df.empty and "Description of Asset" in filtered_df.columns)
+        else []
+    )
 else:
     filtered_equipment_list = sorted(df["Description of Asset"].unique())
     filtered_df = df.copy()
@@ -232,7 +312,16 @@ if existing_df is not None and not existing_df.empty:
 
     if not filtered_df.empty:
         st.markdown("#### Records")
-        display_cols = ["Description of Asset","Department ID", "Asset Number", "Type", "Functional Location", "Status", "Day Left"]
+        display_cols = [
+            "Description of Asset",
+            "Department ID",
+            "Asset Number",
+            "Type",
+            "Functional Location",
+            "Require Calibration",
+            "Status",
+            "Day Left",
+        ]
         available_cols = [c for c in display_cols if c in filtered_df.columns]
         st.dataframe(filtered_df[available_cols], use_container_width=True)
         
@@ -297,7 +386,7 @@ if filtered_equipment_list:
     # CURRENT EQUIPMENT
     # --------------------------------------------------
     current_equipment = filtered_equipment_list[st.session_state.equipment_index]
-    group = df[df["Description of Asset"] == current_equipment]
+    group = filtered_df[filtered_df["Description of Asset"] == current_equipment]
 
     # --------------------------------------------------
     # HEADER
@@ -320,8 +409,19 @@ if filtered_equipment_list:
         st.markdown("### Department ID List")
 
         display_df = (
-            group[['Department ID','Asset Number', 'SAP No.', 'Type', 'Manufacturer/Supplier', 'Model',
-           'Mfg SN', 'Mfg Year', 'Est Value','Status']]
+            group[[
+                'Department ID',
+                'Asset Number',
+                'SAP No.',
+                'Type',
+                'Manufacturer/Supplier',
+                'Model',
+                'Mfg SN',
+                'Mfg Year',
+                'Est Value',
+                'Require Calibration',
+                'Status',
+            ]]
             .drop_duplicates()
             .sort_values("Department ID")
             .reset_index(drop=True)

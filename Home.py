@@ -17,6 +17,7 @@ df = load_existing_data()
 if df is None or df.empty:
     st.error("❌ No asset data found in main_data.db.")
     st.stop()
+    raise SystemExit
 
 # ======================================
 #   FILTER DATA BY STATUS
@@ -83,6 +84,7 @@ if "Description of Asset" in df_filter.columns:
 else:
     st.error("❌ Column 'Description of Asset' not found.")
     st.stop()
+    raise SystemExit
 
 st.markdown("### Asset Quantity Summary")
 st.dataframe(Eq_Quantity, use_container_width=True, hide_index=True)

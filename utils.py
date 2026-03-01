@@ -5,21 +5,27 @@ from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Optional
 import hashlib
+import re
+import json
+import os
+import subprocess
 
 # ======================================
 # CONSTANTS
 # ======================================
 # Single source of truth DB
-MAIN_DB_FILE = Path("data/main_data.db")
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = APP_ROOT / "data"
+MAIN_DB_FILE = DATA_DIR / "main_data.db"
 
 # Legacy DBs (migration only)
-LEGACY_LOG_DB_FILE = Path("data/asset_log.db")
-LEGACY_WORKSHOP_DB_FILE = Path("data/workshop.db")
+LEGACY_LOG_DB_FILE = DATA_DIR / "asset_log.db"
+LEGACY_WORKSHOP_DB_FILE = DATA_DIR / "workshop.db"
 
 # Keep existing name used across the app
 LOG_DB_FILE = MAIN_DB_FILE
 
-REGDATA_DB = Path("data/regdata.db")
+REGDATA_DB = DATA_DIR / "regdata.db"
 
 ASSET_TABLE = "database_me_asset"
 BREAKDOWN_TABLE = "breakdown_report"
@@ -59,6 +65,7 @@ REQUIRED_COLUMNS = [
     "Mfg Year",
     "Est Value",
     "Maintenance Frequency",
+    "Require Calibration",
     "Functional Location",
     "Functional Loc. Description",
     "Assign Project",
@@ -111,8 +118,9 @@ def decode_qr_payload_from_image(uploaded_file) -> Optional[str]:
         return None
 
     try:
-        import numpy as np
-        import cv2
+        import importlib
+        np = importlib.import_module("numpy")
+        cv2 = importlib.import_module("cv2")
     except Exception:
         return None
 
@@ -159,6 +167,157 @@ def ensure_data_directory() -> None:
     MAIN_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _get_secret_or_env(key: str, default: str = "") -> str:
+    """Read a value from Streamlit secrets first, then environment variables."""
+    try:
+        # st.secrets behaves like a dict on Streamlit Cloud.
+        v = st.secrets.get(key)  # type: ignore[attr-defined]
+        if v is not None:
+            return str(v)
+    except Exception:
+        pass
+    return str(os.environ.get(key, default) or default)
+
+
+def _parse_github_https_repo(url: str) -> str:
+    """Return 'owner/repo' from common GitHub remote formats (https/ssh)."""
+    s = str(url or "").strip()
+    if not s:
+        return ""
+
+    # Common patterns:
+    # - https://github.com/owner/repo.git
+    # - http://github.com/owner/repo
+    # - git@github.com:owner/repo.git
+    # - ssh://git@github.com/owner/repo.git
+    if s.startswith("git@github.com:"):
+        tail = s[len("git@github.com:") :]
+    elif s.startswith("ssh://git@github.com/"):
+        tail = s[len("ssh://git@github.com/") :]
+    else:
+        # Normalize https/http (and also handle any string containing github.com)
+        s2 = s
+        if s2.startswith("https://"):
+            s2 = s2[len("https://") :]
+        elif s2.startswith("http://"):
+            s2 = s2[len("http://") :]
+
+        idx = s2.find("github.com")
+        if idx < 0:
+            return ""
+        s2 = s2[idx + len("github.com") :]
+        s2 = s2.lstrip(":/")
+        tail = s2
+
+    tail = tail.strip().strip("/")
+    if tail.endswith(".git"):
+        tail = tail[: -len(".git")]
+
+    parts = [p for p in tail.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool:
+    """Best-effort: git add/commit/push changed files so Streamlit Cloud sleep won't lose edits.
+
+    Requires Streamlit secrets (or env vars):
+    - GITHUB_TOKEN
+    Optional:
+    - GITHUB_REPO (owner/repo) or existing origin remote
+    - GIT_BRANCH (default: main)
+    - GIT_USER_NAME (default: streamlit-bot)
+    - GIT_USER_EMAIL (default: streamlit-bot@users.noreply.github.com)
+    """
+    token = _get_secret_or_env("GITHUB_TOKEN", "").strip()
+    if not token:
+        return False
+
+    repo_root = Path(__file__).resolve().parent
+
+    def _run_git(args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    # Ensure we are in a git repo
+    chk = _run_git(["rev-parse", "--is-inside-work-tree"])
+    if chk.returncode != 0:
+        return False
+
+    # Stage provided paths
+    rel_paths: list[str] = []
+    for p in list(paths or []):
+        if not p:
+            continue
+        try:
+            pp = Path(p)
+            if pp.is_absolute():
+                try:
+                    rel_paths.append(str(pp.relative_to(repo_root)).replace("\\", "/"))
+                except Exception:
+                    # If outside repo, skip.
+                    continue
+            else:
+                rel_paths.append(str(pp).replace("\\", "/"))
+        except Exception:
+            continue
+
+    if not rel_paths:
+        return False
+
+    add = _run_git(["add", "-A", "--", *rel_paths])
+    if add.returncode != 0:
+        return False
+
+    # No changes -> no commit
+    stt = _run_git(["status", "--porcelain"])
+    if stt.returncode != 0:
+        return False
+    if not (stt.stdout or "").strip():
+        return True
+
+    # Configure author
+    user_name = _get_secret_or_env("GIT_USER_NAME", "streamlit-bot").strip() or "streamlit-bot"
+    user_email = _get_secret_or_env("GIT_USER_EMAIL", "streamlit-bot@users.noreply.github.com").strip() or "streamlit-bot@users.noreply.github.com"
+    _run_git(["config", "user.name", user_name])
+    _run_git(["config", "user.email", user_email])
+
+    # Commit
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"Auto-save: {str(reason or 'Update').strip()} ({ts})"
+    cmt = _run_git(["commit", "-m", msg])
+    if cmt.returncode != 0:
+        # If nothing to commit (race), treat as success.
+        if "nothing to commit" in (cmt.stdout or "").lower() or "nothing to commit" in (cmt.stderr or "").lower():
+            return True
+        return False
+
+    # Push
+    branch = _get_secret_or_env("GIT_BRANCH", "main").strip() or "main"
+
+    repo_slug = _get_secret_or_env("GITHUB_REPO", "").strip()
+    if repo_slug and "github.com" in repo_slug:
+        repo_slug = _parse_github_https_repo(repo_slug)
+    if not repo_slug:
+        origin = _run_git(["remote", "get-url", "origin"])
+        if origin.returncode == 0:
+            repo_slug = _parse_github_https_repo((origin.stdout or "").strip())
+
+    if not repo_slug:
+        return False
+
+    # Push URL without persisting token in git config
+    push_url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
+    push = _run_git(["push", push_url, f"HEAD:{branch}"])
+    return push.returncode == 0
+
+
 def _connect_main_db() -> sqlite3.Connection:
     ensure_data_directory()
     conn = sqlite3.connect(MAIN_DB_FILE)
@@ -188,6 +347,25 @@ def _table_row_count(conn: sqlite3.Connection, table: str) -> int:
         return 0
 
 
+def _ensure_text_columns(conn: sqlite3.Connection, table: str, columns: list[str]) -> None:
+    """Best-effort schema migration: add any missing TEXT columns.
+
+    SQLite supports `ALTER TABLE ... ADD COLUMN` (but not drop/modify easily),
+    which is enough for our flexible TEXT-based schema.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(f'PRAGMA table_info("{table}")')
+        existing = {str(r[1]) for r in (cur.fetchall() or [])}
+        for c in list(columns or []):
+            if c in existing:
+                continue
+            cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{c}" TEXT')
+    except Exception:
+        # Keep migration best-effort; app can still work via DataFrame padding.
+        return
+
+
 def _ensure_tables_in_main_db() -> None:
     conn = _connect_main_db()
     try:
@@ -197,11 +375,15 @@ def _ensure_tables_in_main_db() -> None:
         if not _table_exists(conn, ASSET_TABLE):
             cols = ", ".join([f'"{c}" TEXT' for c in REQUIRED_COLUMNS])
             cur.execute(f'CREATE TABLE IF NOT EXISTS "{ASSET_TABLE}" ({cols})')
+        else:
+            _ensure_text_columns(conn, ASSET_TABLE, REQUIRED_COLUMNS)
 
         # Breakdown report
         if not _table_exists(conn, BREAKDOWN_TABLE):
             cols = ", ".join([f'"{c}" TEXT' for c in BREAKDOWN_COLUMNS])
             cur.execute(f'CREATE TABLE IF NOT EXISTS "{BREAKDOWN_TABLE}" ({cols})')
+        else:
+            _ensure_text_columns(conn, BREAKDOWN_TABLE, BREAKDOWN_COLUMNS)
 
         # Asset logs (formerly data/asset_log.db)
         cur.execute(
@@ -241,12 +423,30 @@ def _ensure_tables_in_main_db() -> None:
             """
         )
 
+        # Inventory history (workshop storage add/edit/delete)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL,              -- ADD_PART / UPDATE_PART / DELETE_PART
+                part_number TEXT NOT NULL,
+                performed_by TEXT,
+                note TEXT,
+                before_state TEXT,                 -- JSON
+                after_state TEXT                   -- JSON
+            )
+            """
+        )
+
         # Workshop tables (formerly data/workshop.db)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS storage (
                 part_number TEXT PRIMARY KEY,
                 item_name TEXT,
+                brand TEXT,
+                model TEXT,
                 specification TEXT,
                 total_quantity INTEGER,
                 total_used INTEGER,
@@ -256,6 +456,9 @@ def _ensure_tables_in_main_db() -> None:
             )
             """
         )
+
+        # Schema migration (best-effort): ensure new columns exist on older DBs.
+        _ensure_text_columns(conn, "storage", ["brand", "model"])
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS task_reports (
@@ -278,6 +481,63 @@ def _ensure_tables_in_main_db() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def get_next_department_id(dept_code: str, item_prefix: str) -> str:
+    """Return the next Department ID for a dept+prefix sequence.
+
+    Format: 88-{15ME/15PE}-{PREFIX}-{NNN}
+    Uses the DB as source of truth (more reliable than cached DataFrames).
+    """
+    dept_code = str(dept_code or "").strip().upper()
+    item_prefix = str(item_prefix or "").strip().upper()
+    if dept_code not in {"15ME", "15PE"}:
+        return ""
+    if not item_prefix:
+        return ""
+
+    if not ensure_main_database() or not MAIN_DB_FILE.exists():
+        return f"88-{dept_code}-{item_prefix}-001"
+
+    # LIKE prefix: escape % and _ so they don't act as wildcards.
+    like_prefix = f"88-{dept_code}-{item_prefix}-"
+    like_esc = like_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    conn = _connect_main_db()
+    try:
+        if not _table_exists(conn, ASSET_TABLE):
+            return f"88-{dept_code}-{item_prefix}-001"
+
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT "Department ID" FROM "{ASSET_TABLE}" WHERE COALESCE("Department ID", "") LIKE ? ESCAPE "\\"',
+            (like_esc + "%",),
+        )
+        rows = cur.fetchall() or []
+    except Exception:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    pattern = re.compile(
+        rf"^88-{re.escape(dept_code)}-{re.escape(item_prefix)}-(\d{{3}})$",
+        re.IGNORECASE,
+    )
+    max_n = 0
+    for (val,) in rows:
+        s = str(val or "").strip()
+        m = pattern.match(s)
+        if not m:
+            continue
+        try:
+            max_n = max(max_n, int(m.group(1)))
+        except Exception:
+            continue
+
+    return f"88-{dept_code}-{item_prefix}-{(max_n + 1):03d}"
 
 
 def _migrate_legacy_into_main_db() -> None:
@@ -379,6 +639,11 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
         
         conn.commit()
         conn.close()
+
+        try:
+            persist_repo_changes([str(MAIN_DB_FILE)], reason=f"Asset log: {action}")
+        except Exception:
+            pass
         return True
     except Exception as e:
         st.error(f"❌ Error logging operation: {str(e)}")
@@ -423,6 +688,12 @@ def load_existing_data() -> Optional[pd.DataFrame]:
             if col not in df.columns:
                 df[col] = None
 
+        # Keep derived fields consistent (Day Left / Status can become stale over time).
+        # Avoid DataFrame truthiness ("truth value of a DataFrame is ambiguous").
+        fixed_df = recompute_asset_derived_fields(df)
+        if fixed_df is not None:
+            df = fixed_df
+
         # Keep a consistent column order (required first, then any extras)
         ordered = [c for c in REQUIRED_COLUMNS if c in df.columns] + [c for c in df.columns if c not in REQUIRED_COLUMNS]
         df = df[ordered]
@@ -461,6 +732,11 @@ def save_data(df: pd.DataFrame) -> bool:
             load_existing_data.clear()
         except Exception:
             pass
+
+        try:
+            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update main_data.db")
+        except Exception:
+            pass
         return True
     except Exception as e:
         st.error(f"❌ Error saving data: {str(e)}")
@@ -491,6 +767,11 @@ def delete_asset_by_dept_id(department_id: str) -> bool:
         if deleted > 0:
             try:
                 load_existing_data.clear()
+            except Exception:
+                pass
+
+            try:
+                persist_repo_changes([str(MAIN_DB_FILE)], reason=f"Delete asset {dep}")
             except Exception:
                 pass
         return deleted > 0
@@ -539,6 +820,11 @@ def save_breakdown_report(df: pd.DataFrame) -> bool:
             conn.commit()
         finally:
             conn.close()
+
+        try:
+            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update breakdown report")
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -550,11 +836,45 @@ def check_duplicate(asset_number: str, existing_df: Optional[pd.DataFrame]) -> b
     return not existing_df[asset_match].empty
 
 def calculate_due_date(start_date: date, maintenance_frequency: str) -> Optional[date]:
-    frequency_days = {"Weekly": 7, "Biweekly": 14, "Monthly": 30, "Quarterly": 90, "Yearly": 365}
-    days_to_add = frequency_days.get(maintenance_frequency)
-    if days_to_add:
-        return start_date + timedelta(days=days_to_add)
-    return None
+    """Calculate due date from Start Date + Maintenance Frequency.
+
+    Notes:
+    - Accepts mixed casing from DB (e.g. "YEARLY"), because rows are normalized to uppercase.
+    - Returns None for unknown/blank/"None" frequencies.
+    """
+    if not start_date or not maintenance_frequency:
+        return None
+
+    # Best-effort normalize date input.
+    if not isinstance(start_date, (date, datetime)):
+        start_date = _safe_parse_date_any(start_date)  # type: ignore[assignment]
+        if start_date is None:
+            return None
+    if isinstance(start_date, datetime):
+        start_date = start_date.date()
+
+    freq_key = str(maintenance_frequency or "").strip().casefold()
+    if not freq_key or freq_key in {"none", "n/a", "na"}:
+        return None
+
+    frequency_days = {
+        "weekly": 7,
+        "biweekly": 14,
+        "bi-weekly": 14,
+        "monthly": 30,
+        "quarterly": 90,
+        "half-yearly": 182,
+        "half yearly": 182,
+        "halfyearly": 182,
+        "yearly": 365,
+        "annual": 365,
+        "annually": 365,
+    }
+    days_to_add = frequency_days.get(freq_key)
+    if days_to_add is None:
+        return None
+
+    return start_date + timedelta(days=int(days_to_add))
 
 def calculate_days_left(due_date) -> Optional[int]:
     if not due_date:
@@ -571,12 +891,130 @@ def calculate_days_left(due_date) -> Optional[int]:
 def calculate_status(days_left: Optional[int]) -> str:
     if days_left is None:
         return ""
-    if days_left < 0:
+    # Keep rules consistent with Asset Editor:
+    # - Day Left <= 0 -> Expired
+    # - Day Left < 7  -> Expired Soon
+    if days_left <= 0:
         return "Expired"
-    elif days_left <= 7:
+    elif days_left < 7:
         return "Expired Soon"
     else:
         return "Good"
+
+
+def _safe_parse_date_any(value) -> Optional[date]:
+    """Parse various DB / dataframe date representations into a `date`.
+
+    Accepts `date`, `datetime`, strings (YYYY-MM-DD, etc). Returns None if invalid.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    try:
+        ts = pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return None
+    if ts is None or pd.isna(ts):
+        return None
+    try:
+        return ts.date()
+    except Exception:
+        return None
+
+
+def recompute_asset_derived_fields(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Recompute best-effort derived fields: Due Date (when missing), Day Left, Status.
+
+    This fixes stale rows where Status/Day Left no longer match the rules.
+    The rules mirror `pages/2_AssetEditor.py`:
+    1) Functional Location == Obsolete -> Status = Obsolete
+    2) Day Left <= 0 -> Expired
+    3) Day Left < 7 -> Expired Soon
+    4) Functional Location == 1006-10PE -> Good
+    5) Functional Location other than 1006-10PE -> Idle
+
+    Notes:
+    - If Due Date is missing and Require Calibration != Yes, we derive Due Date from Start Date + Maintenance Frequency.
+    - If Status has a custom value (e.g. NG), we won't overwrite it unless the computed status is Expired/Expired Soon/Obsolete.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Ensure columns exist
+    for col in ["Due Date", "Start Date", "Maintenance Frequency", "Day Left", "Status", "Functional Location", "Require Calibration"]:
+        if col not in out.columns:
+            out[col] = ""
+
+    for idx, row in out.iterrows():
+        func_loc = str(row.get("Functional Location", "") or "").strip()
+        existing_status = str(row.get("Status", "") or "").strip()
+        existing_status_norm = existing_status.casefold()
+
+        # Parse / derive due date
+        due_raw = row.get("Due Date", None)
+        due_dt = _safe_parse_date_any(due_raw)
+
+        req_cal_raw = str(row.get("Require Calibration", "") or "").strip().casefold()
+        calib_required = req_cal_raw in {"yes", "y", "true", "1"}
+
+        if due_dt is None and not calib_required:
+            start_dt = _safe_parse_date_any(row.get("Start Date", None))
+            freq = str(row.get("Maintenance Frequency", "") or "").strip()
+            try:
+                due_dt = calculate_due_date(start_dt, freq) if start_dt else None
+            except Exception:
+                due_dt = None
+
+            # Only backfill Due Date if it was blank/missing
+            if due_dt is not None and not str(due_raw or "").strip():
+                try:
+                    out.at[idx, "Due Date"] = due_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
+        # Day Left
+        days_left = None
+        try:
+            days_left = calculate_days_left(due_dt) if due_dt else None
+        except Exception:
+            days_left = None
+        if days_left is not None:
+            out.at[idx, "Day Left"] = days_left
+
+        # Status (computed)
+        # Apply Expired/Expired Soon when Day Left is known; otherwise fall back to location-based Good/Idle.
+        computed_status = None
+        if func_loc == "Obsolete":
+            computed_status = "Obsolete"
+        elif days_left is not None and days_left <= 0:
+            computed_status = "Expired"
+        elif days_left is not None and days_left < 7:
+            computed_status = "Expired Soon"
+        elif func_loc == "1006-10PE":
+            computed_status = "Good"
+        elif func_loc:
+            computed_status = "Idle"
+
+        # Only overwrite if the existing status is one of our auto statuses,
+        # OR if the computed status is a high-priority state.
+        auto_statuses = {"", "good", "idle", "expired", "expired soon", "obsolete"}
+        high_priority = {"Expired", "Expired Soon", "Obsolete"}
+        if computed_status:
+            if existing_status_norm in auto_statuses or computed_status in high_priority:
+                out.at[idx, "Status"] = computed_status
+
+    return out
 
 def validate_equipment_details(description, equipment_type, manufacturer, model, mfg_sn, mfg_year) -> tuple[bool, str | None]:
     if not description.strip():
@@ -1002,3 +1440,79 @@ def log_stock_operation(
         conn.commit()
     finally:
         conn.close()
+
+
+def initialize_inventory_history_database() -> None:
+    """Creates inventory_history table inside data/main_data.db."""
+    ensure_data_directory()
+    conn = sqlite3.connect(MAIN_DB_FILE)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                action TEXT NOT NULL,
+                part_number TEXT NOT NULL,
+                performed_by TEXT,
+                note TEXT,
+                before_state TEXT,
+                after_state TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_inventory_history(
+    *,
+    action: str,
+    part_number: str,
+    performed_by: str = "",
+    note: str = "",
+    before_state: dict | None = None,
+    after_state: dict | None = None,
+) -> None:
+    """Append a row to inventory_history (best-effort).
+
+    `before_state` and `after_state` are stored as JSON strings.
+    """
+    try:
+        initialize_inventory_history_database()
+
+        def _to_json(value: dict | None) -> str:
+            if not value:
+                return ""
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+        conn = sqlite3.connect(MAIN_DB_FILE)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO inventory_history (
+                    timestamp, action, part_number,
+                    performed_by, note,
+                    before_state, after_state
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    str(action or ""),
+                    str(part_number or ""),
+                    str(performed_by or ""),
+                    str(note or ""),
+                    _to_json(before_state),
+                    _to_json(after_state),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # Never break the app due to logging failures.
+        return
