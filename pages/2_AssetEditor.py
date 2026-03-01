@@ -596,17 +596,13 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     }
 
 def windows_confirm_delete(message: str, title: str = "Confirm delete") -> bool:
-    """Windows system message box confirmation. Returns True if user clicks Yes."""
-    try:
-        import ctypes
-        MB_YESNO = 0x00000004
-        MB_ICONWARNING = 0x00000030
-        IDYES = 6
-        result = ctypes.windll.user32.MessageBoxW(0, message, title, MB_YESNO | MB_ICONWARNING)
-        return result == IDYES
-    except Exception as e:
-        st.error(f"Cannot open Windows confirmation dialog. ({e})")
-        return False
+    """Deprecated.
+
+    Streamlit apps run in the browser, so an OS-level modal dialog cannot be
+    reliably shown to the end user. Keep this function for backward
+    compatibility but do not use it for confirmations.
+    """
+    return True
 
 
 def _norm_for_compare(v):
@@ -1041,16 +1037,6 @@ else:
                             st.stop()
 
                         dept_id_to_delete = st.session_state.get("delete_confirm_dept_id", "")
-                        confirm = windows_confirm_delete(
-                            message=(
-                                "Permanently delete this asset?\n\n"
-                                f"{st.session_state.get('delete_confirm_asset', '')}\n\n"
-                                "This action cannot be undone."
-                            ),
-                            title="Asset Editor - Delete confirmation",
-                        )
-                        if not confirm:
-                            st.stop()
 
                         verified_username = _performed_by_label()
                         if delete_asset_by_dept_id(dept_id_to_delete):
