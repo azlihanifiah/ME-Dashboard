@@ -1062,6 +1062,23 @@ else:
                                 details=f"Type: {record.get('Type', '')}, Manufacturer: {record.get('Manufacturer/Supplier', '')}, Model: {record.get('Model', '')}",
                                 user_name=verified_username,
                             )
+
+                            # Remove orphaned images for this asset
+                            try:
+                                delete_key = _asset_key_prefix(
+                                    department_id=str(record.get("Department ID", "") or ""),
+                                    asset_number=str(record.get("Asset Number", "") or ""),
+                                )
+                                for old in IMG_DIR.iterdir():
+                                    if not old.is_file() or old.suffix.lower() not in _IMAGE_EXTS:
+                                        continue
+                                    if old.name.upper().startswith(f"{delete_key.upper()}_"):
+                                        old.unlink(missing_ok=True)
+
+                                persist_repo_changes([str(IMG_DIR)], reason=f"Delete asset images: {delete_key}")
+                            except Exception:
+                                pass
+
                             st.session_state.delete_confirm_dept_id = None
                             st.session_state.delete_confirm_asset = None
                             st.success("✅ Asset permanently deleted from database!")
