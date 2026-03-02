@@ -9,6 +9,10 @@ import re
 import json
 import os
 import subprocess
+import base64
+import urllib.request
+import urllib.error
+import urllib.parse
 
 # ======================================
 # CONSTANTS
@@ -17,6 +21,10 @@ import subprocess
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / "data"
 MAIN_DB_FILE = DATA_DIR / "main_data.db"
+
+# Optional Git-friendly exports (useful for backups / PR reviews)
+ASSET_EXPORT_CSV = DATA_DIR / "assets_export.csv"
+BREAKDOWN_EXPORT_CSV = DATA_DIR / "breakdown_export.csv"
 
 # Legacy DBs (migration only)
 LEGACY_LOG_DB_FILE = DATA_DIR / "asset_log.db"
@@ -167,6 +175,28 @@ def ensure_data_directory() -> None:
     MAIN_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _sqlite_wal_checkpoint(db_path: Path) -> None:
+    """Force WAL checkpoint so changes land in the main *.db file.
+
+    This matters because when journal_mode=WAL, the latest writes can live in
+    `*.db-wal`, and committing only `*.db` may miss them.
+    """
+    try:
+        if not db_path:
+            return
+        if not Path(db_path).exists():
+            return
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # TRUNCATE merges + resets WAL; safe even if not in WAL mode.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        return
+
+
 def _get_secret_or_env(key: str, default: str = "") -> str:
     """Read a value from Streamlit secrets first, then environment variables."""
     try:
@@ -236,19 +266,191 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
 
     repo_root = Path(__file__).resolve().parent
 
+    # If main_data.db is among the save targets, ensure the WAL is checkpointed
+    # so git/GitHub sees the actual data changes in the *.db file.
+    try:
+        for p in list(paths or []):
+            if not p:
+                continue
+            pp = Path(p)
+            # If a directory is passed, checkpoint the known DB.
+            if pp.is_dir():
+                continue
+            if pp.suffix.lower() == ".db":
+                _sqlite_wal_checkpoint(pp)
+    except Exception:
+        pass
+
+    debug = _get_secret_or_env("PERSIST_REPO_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
     def _run_git(args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        cmd = ["git", *args]
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as e:
+            return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
+        except Exception as e:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(e))
+
+    def _debug(msg: str) -> None:
+        if not debug:
+            return
+        try:
+            st.info(str(msg))
+        except Exception:
+            pass
+
+    def _expand_to_files(raw_paths: list[str]) -> list[Path]:
+        out: list[Path] = []
+        for raw in list(raw_paths or []):
+            if not raw:
+                continue
+            try:
+                p = Path(raw)
+                if not p.is_absolute():
+                    p = (repo_root / p).resolve()
+                if not p.exists():
+                    continue
+                if p.is_file():
+                    out.append(p)
+                    continue
+                if p.is_dir():
+                    for child in p.rglob("*"):
+                        if not child.is_file():
+                            continue
+                        # Skip caches and git internals
+                        if "__pycache__" in child.parts:
+                            continue
+                        if ".git" in child.parts:
+                            continue
+                        out.append(child)
+            except Exception:
+                continue
+        # De-dup (preserve order)
+        seen: set[str] = set()
+        dedup: list[Path] = []
+        for p in out:
+            k = str(p)
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(p)
+        return dedup
+
+    def _github_api_json(method: str, url: str, *, token: str, body: dict | None = None) -> tuple[int, dict | None, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "streamlit-app",
+        }
+        data: bytes | None = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(url=url, data=data, method=method.upper(), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                raw = resp.read() or b""
+                if not raw:
+                    return status, None, ""
+                try:
+                    return status, json.loads(raw.decode("utf-8")), ""
+                except Exception:
+                    return status, None, raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read() or b""
+                text = raw.decode("utf-8", errors="replace")
+            except Exception:
+                text = str(e)
+            return int(getattr(e, "code", 0) or 0), None, text
+        except Exception as e:
+            return 0, None, str(e)
+
+    def _github_get_sha(repo_slug: str, repo_path: str, branch: str) -> str:
+        # GET /repos/{owner}/{repo}/contents/{path}?ref={branch}
+        safe_path = urllib.parse.quote(repo_path.lstrip("/"))
+        safe_branch = urllib.parse.quote(branch)
+        url = f"https://api.github.com/repos/{repo_slug}/contents/{safe_path}?ref={safe_branch}"
+        status, payload, _err = _github_api_json("GET", url, token=token)
+        if status == 200 and isinstance(payload, dict):
+            return str(payload.get("sha") or "")
+        return ""
+
+    def _github_put_file(repo_slug: str, repo_path: str, content_bytes: bytes, *, message: str, branch: str) -> bool:
+        # GitHub Contents API is best-effort; keep file sizes modest.
+        # Officially limited (~1MB payload). We enforce a conservative cap.
+        max_bytes = 900_000
+        if content_bytes is None:
+            return False
+        if len(content_bytes) > max_bytes:
+            _debug(f"Skip GitHub API save (too large): {repo_path} ({len(content_bytes)} bytes)")
+            return False
+
+        sha = _github_get_sha(repo_slug, repo_path, branch)
+        safe_path = urllib.parse.quote(repo_path.lstrip("/"))
+        url = f"https://api.github.com/repos/{repo_slug}/contents/{safe_path}"
+        body: dict = {
+            "message": message,
+            "content": base64.b64encode(content_bytes).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            body["sha"] = sha
+
+        status, _payload, err = _github_api_json("PUT", url, token=token, body=body)
+        if status in {200, 201}:
+            return True
+        if err:
+            _debug(f"GitHub API PUT failed for {repo_path}: HTTP {status} {err[:200]}")
+        return False
+
+    def _persist_via_github_api(raw_paths: list[str]) -> bool:
+        repo_slug = _get_secret_or_env("GITHUB_REPO", "").strip()
+        if repo_slug and "github.com" in repo_slug:
+            repo_slug = _parse_github_https_repo(repo_slug)
+        if not repo_slug:
+            _debug("GITHUB_REPO not set; cannot use GitHub API fallback")
+            return False
+
+        branch = _get_secret_or_env("GIT_BRANCH", "main").strip() or "main"
+        files = _expand_to_files(raw_paths)
+        if not files:
+            return False
+
+        ok_any = False
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        base_msg = f"Auto-save: {str(reason or 'Update').strip()} ({ts})"
+
+        for f in files:
+            try:
+                # Only commit files inside repo_root
+                try:
+                    rel = f.resolve().relative_to(repo_root)
+                except Exception:
+                    continue
+                # Normalize to forward slashes for GitHub paths
+                repo_path = str(rel).replace("\\", "/")
+                content = f.read_bytes()
+                if _github_put_file(repo_slug, repo_path, content, message=base_msg, branch=branch):
+                    ok_any = True
+            except Exception:
+                continue
+        return ok_any
 
     # Ensure we are in a git repo
     chk = _run_git(["rev-parse", "--is-inside-work-tree"])
     if chk.returncode != 0:
-        return False
+        _debug("Not a git work tree; trying GitHub API fallback")
+        return _persist_via_github_api(paths)
 
     # Stage provided paths
     rel_paths: list[str] = []
@@ -273,12 +475,14 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
 
     add = _run_git(["add", "-A", "--", *rel_paths])
     if add.returncode != 0:
-        return False
+        _debug("git add failed; trying GitHub API fallback")
+        return _persist_via_github_api(paths)
 
     # No changes -> no commit
     stt = _run_git(["status", "--porcelain"])
     if stt.returncode != 0:
-        return False
+        _debug("git status failed; trying GitHub API fallback")
+        return _persist_via_github_api(paths)
     if not (stt.stdout or "").strip():
         return True
 
@@ -296,7 +500,8 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
         # If nothing to commit (race), treat as success.
         if "nothing to commit" in (cmt.stdout or "").lower() or "nothing to commit" in (cmt.stderr or "").lower():
             return True
-        return False
+        _debug("git commit failed; trying GitHub API fallback")
+        return _persist_via_github_api(paths)
 
     # Push
     branch = _get_secret_or_env("GIT_BRANCH", "main").strip() or "main"
@@ -310,12 +515,17 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
             repo_slug = _parse_github_https_repo((origin.stdout or "").strip())
 
     if not repo_slug:
-        return False
+        _debug("Could not determine repo slug; trying GitHub API fallback")
+        return _persist_via_github_api(paths)
 
     # Push URL without persisting token in git config
     push_url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
     push = _run_git(["push", push_url, f"HEAD:{branch}"])
-    return push.returncode == 0
+    if push.returncode == 0:
+        return True
+
+    _debug("git push failed; trying GitHub API fallback")
+    return _persist_via_github_api(paths)
 
 
 def _connect_main_db() -> sqlite3.Connection:
@@ -327,6 +537,14 @@ def _connect_main_db() -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
+
+def _checkpoint_main_db(conn: sqlite3.Connection) -> None:
+    """Best-effort WAL checkpoint for the main DB connection."""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        return
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -603,7 +821,7 @@ def initialize_log_database() -> None:
     """Initialize SQLite database for logging asset operations"""
     try:
         ensure_main_database()
-        conn = sqlite3.connect(LOG_DB_FILE)
+        conn = _connect_main_db()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS asset_logs (
@@ -618,6 +836,7 @@ def initialize_log_database() -> None:
             )
         """)
         conn.commit()
+        _checkpoint_main_db(conn)
         conn.close()
     except Exception as e:
         st.error(f"❌ Error initializing log database: {str(e)}")
@@ -627,7 +846,7 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
     """Log asset add/update operations to SQLite database"""
     try:
         initialize_log_database()
-        conn = sqlite3.connect(LOG_DB_FILE)
+    conn = _connect_main_db()
         cursor = conn.cursor()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -638,6 +857,7 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
         """, (timestamp, action, department_id, asset_number, description, details, user_name))
         
         conn.commit()
+        _checkpoint_main_db(conn)
         conn.close()
 
         try:
@@ -725,8 +945,20 @@ def save_data(df: pd.DataFrame) -> bool:
         try:
             df.to_sql(ASSET_TABLE, conn, if_exists="replace", index=False)
             conn.commit()
+            _checkpoint_main_db(conn)
+            conn.commit()
         finally:
             conn.close()
+
+        # Git-friendly export (best-effort)
+        try:
+            ensure_data_directory()
+            export_df = df.copy()
+            ordered = [c for c in REQUIRED_COLUMNS if c in export_df.columns] + [c for c in export_df.columns if c not in REQUIRED_COLUMNS]
+            export_df = export_df[ordered]
+            export_df.to_csv(ASSET_EXPORT_CSV, index=False)
+        except Exception:
+            pass
 
         try:
             load_existing_data.clear()
@@ -734,7 +966,7 @@ def save_data(df: pd.DataFrame) -> bool:
             pass
 
         try:
-            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update main_data.db")
+            persist_repo_changes([str(MAIN_DB_FILE), str(ASSET_EXPORT_CSV)], reason="Update assets")
         except Exception:
             pass
         return True
@@ -760,6 +992,8 @@ def delete_asset_by_dept_id(department_id: str) -> bool:
                 (dep,),
             )
             deleted = int(cur.rowcount or 0)
+            conn.commit()
+            _checkpoint_main_db(conn)
             conn.commit()
         finally:
             conn.close()
@@ -818,11 +1052,20 @@ def save_breakdown_report(df: pd.DataFrame) -> bool:
         try:
             df.to_sql(BREAKDOWN_TABLE, conn, if_exists="replace", index=False)
             conn.commit()
+            _checkpoint_main_db(conn)
+            conn.commit()
         finally:
             conn.close()
 
+        # Git-friendly export (best-effort)
         try:
-            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update breakdown report")
+            ensure_data_directory()
+            df.to_csv(BREAKDOWN_EXPORT_CSV, index=False)
+        except Exception:
+            pass
+
+        try:
+            persist_repo_changes([str(MAIN_DB_FILE), str(BREAKDOWN_EXPORT_CSV)], reason="Update breakdown report")
         except Exception:
             pass
         return True
