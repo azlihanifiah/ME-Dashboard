@@ -846,19 +846,28 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
     """Log asset add/update operations to SQLite database"""
     try:
         initialize_log_database()
-    conn = _connect_main_db()
-        cursor = conn.cursor()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        cursor.execute("""
-            INSERT INTO asset_logs 
-            (timestamp, action, department_id, asset_number, description, details, user_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (timestamp, action, department_id, asset_number, description, details, user_name))
-        
-        conn.commit()
-        _checkpoint_main_db(conn)
-        conn.close()
+        conn = _connect_main_db()
+        try:
+            cursor = conn.cursor()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            cursor.execute(
+                """
+                INSERT INTO asset_logs
+                (timestamp, action, department_id, asset_number, description, details, user_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (timestamp, action, department_id, asset_number, description, details, user_name),
+            )
+
+            conn.commit()
+            _checkpoint_main_db(conn)
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         try:
             persist_repo_changes([str(MAIN_DB_FILE)], reason=f"Asset log: {action}")
@@ -876,7 +885,7 @@ def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
         if not LOG_DB_FILE.exists():
             return None
         
-        conn = sqlite3.connect(LOG_DB_FILE)
+        conn = sqlite3.connect(str(LOG_DB_FILE))
         df = pd.read_sql_query(
             "SELECT * FROM asset_logs ORDER BY timestamp DESC LIMIT ?",
             conn,
@@ -1352,7 +1361,7 @@ def _discover_regdata_layout(db_path_str: str):
     if not db_path.exists():
         return None
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(str(db_path))
     try:
         tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 
@@ -1426,16 +1435,26 @@ def lookup_regdata_user(identifier: str, *, allow_userid: bool = True, allow_qr:
     where_parts: list[str] = []
     params: list[str] = []
     if allow_userid and user_col:
-        where_parts.append(f"{_quote_ident(user_col)} = ?")
+        user_expr = f"TRIM({_quote_ident(user_col)})"
+        where_parts.append(f"{user_expr} = ?")
         params.append(identifier)
     if allow_qr and qr_col:
-        where_parts.append(f"{_quote_ident(qr_col)} = ?")
+        qr_expr = f"TRIM({_quote_ident(qr_col)})"
+        where_parts.append(f"{qr_expr} = ?")
         params.append(identifier)
+
+        # Support common QR formats like "USERID;BARCODE".
+        # Some scanners return only the first part (USERID) or only the second part (BARCODE).
+        if ";" not in identifier:
+            where_parts.append(f"{qr_expr} LIKE ?")
+            params.append(f"{identifier};%")
+            where_parts.append(f"{qr_expr} LIKE ?")
+            params.append(f"%;{identifier}")
 
     if not where_parts:
         return {"ok": False, "error": "regdata.db layout found but no usable UserID/QRID columns.", "user_id": "", "display_name": "", "level_name": "", "level_rank": 0}
 
-    conn = sqlite3.connect(REGDATA_DB)
+    conn = sqlite3.connect(str(REGDATA_DB))
     try:
         query = f"SELECT * FROM {_quote_ident(table)} WHERE " + " OR ".join(where_parts) + " LIMIT 1"
         cur = conn.cursor()
@@ -1511,6 +1530,8 @@ def require_login(*, min_level_rank: int = 1) -> dict:
     with st.sidebar:
         st.markdown("### 🔐 Login")
 
+        login_debug = _get_secret_or_env("LOGIN_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
         if st.session_state.get("auth_ok"):
             name = st.session_state.get("auth_name") or st.session_state.get("auth_user_id")
             lvl = st.session_state.get("auth_level_name")
@@ -1533,6 +1554,18 @@ def require_login(*, min_level_rank: int = 1) -> dict:
                 )
                 if not res.get("ok"):
                     st.error(res.get("error") or "Login failed.")
+
+                    if login_debug:
+                        try:
+                            st.markdown("**Login Debug**")
+                            st.caption(f"REGDATA_DB: {REGDATA_DB}")
+                            st.caption(f"Exists: {REGDATA_DB.exists()}")
+                            if REGDATA_DB.exists():
+                                st.caption(f"Size: {REGDATA_DB.stat().st_size} bytes")
+                            layout = _discover_regdata_layout(str(REGDATA_DB)) if REGDATA_DB.exists() else None
+                            st.write("Discovered layout:", layout)
+                        except Exception as e:
+                            st.write("Debug error:", str(e))
                 elif int(res.get("level_rank") or 0) < int(min_level_rank):
                     st.error("Access denied for this app.")
                 else:
