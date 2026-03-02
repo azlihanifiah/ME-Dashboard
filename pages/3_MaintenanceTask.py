@@ -89,7 +89,12 @@ def build_task_report_pdf(row: dict) -> bytes:
         pagesizes = importlib.import_module("reportlab.lib.pagesizes")
         A4 = getattr(pagesizes, "A4")
     except Exception as e:
-        raise RuntimeError("PDF dependency missing. Install 'reportlab'.") from e
+        raise RuntimeError(
+            "PDF export is unavailable because ReportLab could not be imported. "
+            f"({type(e).__name__}: {e})\n\n"
+            "Fix: ensure `reportlab` is listed in requirements.txt and redeploy/reboot the Streamlit app. "
+            "If it is already listed, the error above indicates the real root cause (e.g., build/import failure)."
+        ) from e
 
     page_w, page_h = A4
     margin_x = 48
