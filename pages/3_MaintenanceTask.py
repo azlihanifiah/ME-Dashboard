@@ -14,6 +14,8 @@ from utils import (
     require_login,
     load_breakdown_report,
     save_breakdown_report,
+    show_system_error,
+    show_user_error,
 )
 
 st.set_page_config(page_title="Task Report", page_icon="🔧", layout="wide")
@@ -825,7 +827,7 @@ def load_breakdown_data() -> pd.DataFrame:
                 df[col] = ""
         return df[COLUMNS]
     except Exception as e:
-        st.error(f"Error loading breakdown report from main_data.db: {e}")
+        show_system_error("Failed to load breakdown report from database.", e, context="TaskReport.load_breakdown_data")
         return pd.DataFrame(columns=COLUMNS)
 
 
@@ -1090,7 +1092,7 @@ with tab_generate:
     col_dur, col_status = st.columns(2)
     with col_dur:
         if duration_err:
-            st.error(duration_err)
+            show_user_error(duration_err)
             st.text_input("Duration (auto, minutes)", value="—", disabled=True, key="br_duration_display")
         else:
             st.text_input("Duration (auto, minutes)", value=str(duration_min), disabled=True, key="br_duration_display")
@@ -1171,25 +1173,25 @@ with tab_generate:
 
     if st.button("✅ Submit Report", type="primary"):
         if duration_err:
-            st.error(duration_err)
+            show_user_error(duration_err)
         elif not str(shift).strip():
-            st.error("Shift is required.")
+            show_user_error("Shift is required.")
         elif not str(location).strip():
-            st.error("Location is required.")
+            show_user_error("Location is required.")
         elif not str(machine_equipment).strip():
-            st.error("Machine/Equipment is required.")
+            show_user_error("Machine/Equipment is required.")
         elif not str(machine_id).strip():
-            st.error("Machine ID is required.")
+            show_user_error("Machine ID is required.")
         elif not problem_description.strip():
-            st.error("Problem Description is required.")
+            show_user_error("Problem Description is required.")
         elif not immediate_action.strip():
-            st.error("Immediate Action is required.")
+            show_user_error("Immediate Action is required.")
         elif not root_cause.strip():
-            st.error("Root Cause is required.")
+            show_user_error("Root Cause is required.")
         elif not preventive_action.strip():
-            st.error("Preventive Action is required.")
+            show_user_error("Preventive Action is required.")
         elif spare_used and not st.session_state.spare_parts:
-            st.error("You ticked 'Spare parts used?' but did not add any parts.")
+            show_user_error("You ticked 'Spare parts used?' but did not add any parts.")
         else:
             reported_by_name = _performed_by_label()
 

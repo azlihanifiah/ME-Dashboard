@@ -15,6 +15,7 @@ from utils import (
     get_next_department_id,
     recompute_asset_derived_fields,
     persist_repo_changes,
+    show_user_error,
 )
 
 auth = require_login()
@@ -709,7 +710,7 @@ if st.session_state.show_add_form:
             form_vals["Mfg Year"]
         )
         if not is_valid:
-            st.error(error_msg)
+            show_user_error(error_msg)
         else:
             verified_username = _performed_by_label()
             row = {
@@ -940,7 +941,7 @@ else:
                 form_vals["Mfg Year"]
             )
             if not is_valid:
-                st.error(error_msg)
+                show_user_error(error_msg)
             else:
                 verified_username = _performed_by_label()
                 old_row_for_log = {}
