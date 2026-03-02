@@ -13,6 +13,7 @@ import base64
 import urllib.request
 import urllib.error
 import urllib.parse
+import traceback
 
 # ======================================
 # CONSTANTS
@@ -101,6 +102,68 @@ ASSET_COLUMNS_REMOVE = {
 # ======================================
 # HELPER FUNCTIONS
 # ======================================
+
+
+class UserInputError(ValueError):
+    """Raised when a user-provided value is invalid (show as 'Wrong input')."""
+
+
+def _debug_enabled() -> bool:
+    """Enable debug details when APP_DEBUG=1/true in Streamlit secrets or env."""
+    return _get_secret_or_env("APP_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def show_user_error(message: str) -> None:
+    """User-facing error for invalid input."""
+    try:
+        st.warning(f"Wrong input: {str(message or '').strip()}")
+    except Exception:
+        return
+
+
+def show_system_error(message: str, err: Exception | None = None, *, context: str = "") -> None:
+    """User-facing error for system failures; shows details only in debug mode."""
+    try:
+        st.error(f"System error: {str(message or '').strip()}")
+        if _debug_enabled() and err is not None:
+            title = f"Details{': ' + context if context else ''}"
+            with st.expander(title, expanded=False):
+                try:
+                    st.exception(err)
+                except Exception:
+                    st.code("".join(traceback.format_exception(type(err), err, err.__traceback__)))
+    except Exception:
+        return
+
+
+def handle_exception(err: Exception, *, user_message: str, context: str = "") -> None:
+    """Route exceptions to Wrong input vs System error."""
+    if isinstance(err, UserInputError):
+        show_user_error(user_message or str(err))
+        return
+    show_system_error(user_message, err, context=context)
+
+
+def require_text(value: object, field_name: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        raise UserInputError(f"{field_name} is required.")
+    return s
+
+
+def require_int(value: object, field_name: str, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    s = str(value or "").strip()
+    if s == "":
+        raise UserInputError(f"{field_name} is required.")
+    try:
+        n = int(float(s))
+    except Exception as e:
+        raise UserInputError(f"{field_name} must be a number.") from e
+    if min_value is not None and n < int(min_value):
+        raise UserInputError(f"{field_name} must be ≥ {int(min_value)}.")
+    if max_value is not None and n > int(max_value):
+        raise UserInputError(f"{field_name} must be ≤ {int(max_value)}.")
+    return n
 
 def decode_qr_payload_from_image(uploaded_file) -> Optional[str]:
     """Decode a QR code payload from a Streamlit uploaded image.
@@ -839,7 +902,7 @@ def initialize_log_database() -> None:
         _checkpoint_main_db(conn)
         conn.close()
     except Exception as e:
-        st.error(f"❌ Error initializing log database: {str(e)}")
+        show_system_error("Failed to initialize log database.", e, context="initialize_log_database")
 
 def log_asset_operation(action: str, department_id: str, asset_number: str, 
                         description: str, details: str = "", user_name: str = "System") -> bool:
@@ -875,7 +938,7 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
             pass
         return True
     except Exception as e:
-        st.error(f"❌ Error logging operation: {str(e)}")
+        show_system_error("Failed to write asset log.", e, context="log_asset_operation")
         return False
 
 def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
@@ -894,7 +957,7 @@ def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
         conn.close()
         return df if not df.empty else None
     except Exception as e:
-        st.error(f"❌ Error retrieving logs: {str(e)}")
+        show_system_error("Failed to read asset logs.", e, context="get_asset_logs")
         return None
 
 @st.cache_data
@@ -932,7 +995,7 @@ def load_existing_data() -> Optional[pd.DataFrame]:
         df.index.name = "Index"
         return df
     except Exception as e:
-        st.error(f"❌ Error reading data file: {str(e)}")
+        show_system_error("Failed to load asset data.", e, context="load_existing_data")
         return None
 
 def save_data(df: pd.DataFrame) -> bool:
@@ -980,7 +1043,7 @@ def save_data(df: pd.DataFrame) -> bool:
             pass
         return True
     except Exception as e:
-        st.error(f"❌ Error saving data: {str(e)}")
+        show_system_error("Failed to save asset data.", e, context="save_data")
         return False
 
 def delete_asset_by_dept_id(department_id: str) -> bool:
@@ -1019,7 +1082,7 @@ def delete_asset_by_dept_id(department_id: str) -> bool:
                 pass
         return deleted > 0
     except Exception as e:
-        st.error(f"❌ Error deleting asset: {str(e)}")
+        show_system_error("Failed to delete asset.", e, context="delete_asset_by_dept_id")
         return False
 
 
@@ -1078,7 +1141,8 @@ def save_breakdown_report(df: pd.DataFrame) -> bool:
         except Exception:
             pass
         return True
-    except Exception:
+    except Exception as e:
+        show_system_error("Failed to save breakdown report.", e, context="save_breakdown_report")
         return False
 
 def check_duplicate(asset_number: str, existing_df: Optional[pd.DataFrame]) -> bool:
@@ -1553,7 +1617,17 @@ def require_login(*, min_level_rank: int = 1) -> dict:
                     allow_qr=True,
                 )
                 if not res.get("ok"):
-                    st.error(res.get("error") or "Login failed.")
+                    msg = str(res.get("error") or "Login failed.")
+                    msg_norm = msg.strip().lower()
+                    is_wrong_input = (
+                        "required" in msg_norm
+                        or "not found" in msg_norm
+                        or "access denied" in msg_norm
+                    )
+                    if is_wrong_input:
+                        show_user_error(msg)
+                    else:
+                        show_system_error(msg)
 
                     if login_debug:
                         try:

@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import re
-from utils import load_existing_data, load_breakdown_report, require_login
+from utils import load_existing_data, load_breakdown_report, require_login, show_system_error
 
 st.set_page_config(page_title="ME Dashboard", page_icon="📊", layout="wide")
 require_login()
@@ -339,4 +339,4 @@ try:
             )
 
 except Exception as e:
-    st.error(f"Failed to load/plot breakdown report data: {e}")
+    show_system_error("Failed to load/plot breakdown report data.", e, context="Home.TaskReport")
