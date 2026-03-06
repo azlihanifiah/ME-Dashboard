@@ -37,3 +37,4 @@ Date,Job ID,Job Type,Severity,Shift,Location,Machine/Equipment,Machine ID,Date/T
 2026-03-05,26-03-05/06,Other,Medium,Morning,Store,N/A,N/A,2026-03-05 10:00:00,2026-03-05 11:15:00,75,Close,Plate overlap with others plate in  wrapping,lift and move the plate,N/A,N/A,,NOOR AINA AMIRA BINTI SABARI,2026-03-05 14:39:03
 2026-03-05,26-03-05/07,Other,Low,DAY,PACKING LINE,NA,NA,2026-03-05 09:15:00,2026-03-05 09:15:00,0,Close,Inventory has not been keyed in.,Inventory has been keyed in.,NA,NA,,WAN NUR SYAFIQAH BINTI WAN HAMIMI,2026-03-05 14:42:55
 2026-03-05,26-03-05/08,Other,Low,DAY,WORKSHOP,NA,NA,2026-03-05 13:30:00,2026-03-05 15:45:00,135,Close,The rack is not available.,Rack installation and wiring.,NA,NA,,WAN NUR SYAFIQAH BINTI WAN HAMIMI,2026-03-05 14:45:57
+2026-03-06,26-03-06/01,Other,Low,DAY,WORKSHOP,NA,NA,2026-03-06 08:30:00,2026-03-06 08:45:00,15,Close,Inventory not updated,Inventory updated,NA,NA,,WAN NUR SYAFIQAH BINTI WAN HAMIMI,2026-03-06 00:53:59
