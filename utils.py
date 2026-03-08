@@ -53,12 +53,19 @@ BREAKDOWN_COLUMNS = [
     "Duration",
     "JobStatus",
     "Problem Description",
+    "Job Title",
+    "Job Description",
+    "Remark",
+    "Assign By",
     "Immediate Action",
     "Root Cause",
     "Preventive Action",
     "Spare Parts Used",
     "Reported By",
     "Created At",
+    "Approval Status",
+    "Approved By",
+    "Approved At",
 ]
 REQUIRED_COLUMNS = [
     "Prefix",
@@ -1104,6 +1111,32 @@ def load_breakdown_report() -> pd.DataFrame:
     for col in BREAKDOWN_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+
+    # Approval workflow normalization:
+    # Legacy values: Pending/Approved/blank
+    # Current values: Completed/Close
+    if "Approval Status" in df.columns:
+        def _norm_approval(v: object) -> str:
+            s = str(v or "").strip()
+            if not s or s.casefold() in {"none", "nan"}:
+                return "Completed"
+            key = s.casefold()
+            if key in {"inprogress", "in progress", "in_progress"}:
+                return "InProgress"
+            if key == "pending":
+                return "Completed"
+            if key == "approved":
+                return "Approved"
+            if key in {"close", "closed"}:
+                return "Approved"
+            if key == "completed":
+                return "Completed"
+            return s
+
+        try:
+            df["Approval Status"] = df["Approval Status"].map(_norm_approval)
+        except Exception:
+            pass
     return df[BREAKDOWN_COLUMNS]
 
 
@@ -1570,6 +1603,53 @@ def lookup_regdata_user(identifier: str, *, allow_userid: bool = True, allow_qr:
             conn.close()
         except Exception:
             pass
+
+
+@st.cache_data(show_spinner=False)
+def list_regdata_display_names() -> list[str]:
+    """List display names from regdata.db (best-effort).
+
+    Uses the discovered regdata layout. Returns sorted unique values.
+    """
+    if not REGDATA_DB.exists():
+        return []
+
+    layout = _discover_regdata_layout(str(REGDATA_DB))
+    if not layout:
+        return []
+
+    table = layout.get("table")
+    user_col = layout.get("user_col")
+    name_col = layout.get("name_col")
+    if not table or (not user_col and not name_col):
+        return []
+
+    # Prefer name column; fall back to user id.
+    select_cols: list[str] = []
+    if name_col:
+        select_cols.append(_quote_ident(name_col))
+    if user_col and user_col != name_col:
+        select_cols.append(_quote_ident(user_col))
+
+    conn = sqlite3.connect(str(REGDATA_DB))
+    try:
+        rows = conn.execute(
+            f"SELECT {', '.join(select_cols)} FROM {_quote_ident(table)}",
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out: list[str] = []
+    for r in rows:
+        vals = [str(v or "").strip() for v in r]
+        # First non-empty wins (name preferred by select order)
+        v = next((x for x in vals if x), "")
+        if v:
+            out.append(v)
+
+    # Unique + stable sort
+    out = sorted({x for x in out if x}, key=lambda s: s.casefold())
+    return out
 
 
 def require_login(*, min_level_rank: int = 1) -> dict:
