@@ -1928,6 +1928,21 @@ def render_role_navigation(auth: dict | None = None) -> None:
 
     Intended to be used with Streamlit's built-in sidebar navigation hidden.
     """
+    # In some deployments (e.g., Streamlit Cloud), `.streamlit/config.toml` may not
+    # be picked up as expected, resulting in Streamlit's default page list showing
+    # above our custom navigation. Hide it defensively here.
+    try:
+        st.markdown(
+            """
+            <style>
+              [data-testid="stSidebarNav"] { display: none; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass
+
     try:
         ctx = auth or {
             "ok": bool(st.session_state.get("auth_ok")),
