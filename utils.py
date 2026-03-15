@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 import hashlib
 import re
@@ -15,6 +16,11 @@ import urllib.error
 import urllib.parse
 import traceback
 
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
+
 # ======================================
 # CONSTANTS
 # ======================================
@@ -25,7 +31,6 @@ MAIN_DB_FILE = DATA_DIR / "main_data.db"
 
 # Optional Git-friendly exports (useful for backups / PR reviews)
 ASSET_EXPORT_CSV = DATA_DIR / "assets_export.csv"
-BREAKDOWN_EXPORT_CSV = DATA_DIR / "breakdown_export.csv"
 
 # Legacy DBs (migration only)
 LEGACY_LOG_DB_FILE = DATA_DIR / "asset_log.db"
@@ -37,36 +42,55 @@ LOG_DB_FILE = MAIN_DB_FILE
 REGDATA_DB = DATA_DIR / "regdata.db"
 
 ASSET_TABLE = "database_me_asset"
-BREAKDOWN_TABLE = "breakdown_report"
+# New (2026-03): unified task table for all job types.
+TASK_TABLE = "task"
 
-BREAKDOWN_COLUMNS = [
+# Column names intentionally match the UI spec (spaces/underscores preserved).
+TASK_COLUMNS = [
+    "Create by",
+    "Create at",
+    "Reported by",
+    "Reported at",
+    "Verify By",
+    "Associates",
+    "Assign by",
     "Date",
     "Job ID",
     "Job Type",
+    "Maintenance Frequency",
     "Severity",
+    "Priority",
     "Shift",
     "Location",
     "Machine/Equipment",
     "Machine ID",
-    "Date/Time Start",
-    "Date/Time End",
-    "Duration",
+    "Machine ID not in list",
+    "Date_Time Start",
+    "Date_Time End",
+    "Duration E",
+    "Duration report",
     "JobStatus",
-    "Problem Description",
-    "Job Title",
-    "Job Description",
-    "Remark",
-    "Assign By",
-    "Immediate Action",
+    "Problem_Task_Job Description",
+    "Immediate Action_Action",
     "Root Cause",
     "Preventive Action",
+    "Remark",
     "Spare Parts Used",
-    "Reported By",
-    "Created At",
     "Approval Status",
     "Approved By",
     "Approved At",
+    "Rejected By",
+    "Rejected At",
+    "Rejection Justification",
+
+    # Report duration tracking (for Duration report semantics)
+    "Report Started At",
+    "Report Cycle Start At",
+    "Report Accumulated Min",
+    "Completed At",
+    "Completed By",
 ]
+
 REQUIRED_COLUMNS = [
     "Prefix",
     "Department ID",
@@ -277,6 +301,65 @@ def _get_secret_or_env(key: str, default: str = "") -> str:
     except Exception:
         pass
     return str(os.environ.get(key, default) or default)
+
+
+# ======================================
+# TIMEZONE (Singapore, UTC+8)
+# ======================================
+
+DEFAULT_APP_TIMEZONE = "Asia/Singapore"
+
+
+@lru_cache(maxsize=1)
+def _app_tzinfo():
+    """Return the app timezone tzinfo (defaults to Asia/Singapore).
+
+    On Windows, setting the process TZ is unreliable; we instead always use
+    timezone-aware datetimes explicitly.
+    """
+    tz_name = _get_secret_or_env("APP_TIMEZONE", DEFAULT_APP_TIMEZONE).strip() or DEFAULT_APP_TIMEZONE
+    # Friendly aliases
+    if tz_name.casefold() in {"sg", "singapore", "asia/singapore"}:
+        tz_name = DEFAULT_APP_TIMEZONE
+
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            try:
+                return ZoneInfo(DEFAULT_APP_TIMEZONE)
+            except Exception:
+                pass
+
+    # Fallback: fixed UTC+8 offset (no DST for SG)
+    return timezone(timedelta(hours=8))
+
+
+def now_sg() -> datetime:
+    """Current time in Singapore (timezone-aware)."""
+    return datetime.now(_app_tzinfo())
+
+
+def today_sg() -> date:
+    """Current date in Singapore."""
+    return now_sg().date()
+
+
+def format_ts_sg(value: datetime | None = None, *, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Format a timestamp in Singapore local time."""
+    dt = value or now_sg()
+    try:
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_app_tzinfo())
+            else:
+                dt = dt.astimezone(_app_tzinfo())
+    except Exception:
+        dt = value or now_sg()
+    try:
+        return dt.strftime(fmt)
+    except Exception:
+        return str(dt)
 
 
 def _parse_github_https_repo(url: str) -> str:
@@ -497,7 +580,7 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
             return False
 
         ok_any = False
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = format_ts_sg()
         base_msg = f"Auto-save: {str(reason or 'Update').strip()} ({ts})"
 
         for f in files:
@@ -563,7 +646,7 @@ def persist_repo_changes(paths: list[str], *, reason: str = "Auto-save") -> bool
     _run_git(["config", "user.email", user_email])
 
     # Commit
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = format_ts_sg()
     msg = f"Auto-save: {str(reason or 'Update').strip()} ({ts})"
     cmt = _run_git(["commit", "-m", msg])
     if cmt.returncode != 0:
@@ -666,12 +749,12 @@ def _ensure_tables_in_main_db() -> None:
         else:
             _ensure_text_columns(conn, ASSET_TABLE, REQUIRED_COLUMNS)
 
-        # Breakdown report
-        if not _table_exists(conn, BREAKDOWN_TABLE):
-            cols = ", ".join([f'"{c}" TEXT' for c in BREAKDOWN_COLUMNS])
-            cur.execute(f'CREATE TABLE IF NOT EXISTS "{BREAKDOWN_TABLE}" ({cols})')
+        # Task table (new)
+        if not _table_exists(conn, TASK_TABLE):
+            cols = ", ".join([f'"{c}" TEXT' for c in TASK_COLUMNS])
+            cur.execute(f'CREATE TABLE IF NOT EXISTS "{TASK_TABLE}" ({cols})')
         else:
-            _ensure_text_columns(conn, BREAKDOWN_TABLE, BREAKDOWN_COLUMNS)
+            _ensure_text_columns(conn, TASK_TABLE, TASK_COLUMNS)
 
         # Asset logs (formerly data/asset_log.db)
         cur.execute(
@@ -732,21 +815,50 @@ def _ensure_tables_in_main_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS storage (
                 part_number TEXT PRIMARY KEY,
+                part_type TEXT,
                 item_name TEXT,
                 brand TEXT,
                 model TEXT,
                 specification TEXT,
+                preferred_supplier TEXT,
+                item_cost_rm REAL,
                 total_quantity INTEGER,
-                total_used INTEGER,
-                total_add INTEGER,
-                part_type TEXT,
-                usage TEXT
+                usage_area TEXT,
+                total_in INTEGER,
+                total_out INTEGER
             )
             """
         )
 
-        # Schema migration (best-effort): ensure new columns exist on older DBs.
-        _ensure_text_columns(conn, "storage", ["brand", "model"])
+        # Schema migration (best-effort): ensure newer columns exist on older DBs.
+        # Note: Some pages also run a deeper migration/rebuild. Here we just ensure
+        # the main DB can accept inserts for the v2 columns.
+        _ensure_text_columns(
+            conn,
+            "storage",
+            [
+                "part_type",
+                "item_name",
+                "brand",
+                "model",
+                "specification",
+                "preferred_supplier",
+                "usage_area",
+            ],
+        )
+        try:
+            cur.execute("PRAGMA table_info(storage)")
+            cols = {r[1] for r in (cur.fetchall() or [])}
+            if "item_cost_rm" not in cols:
+                cur.execute("ALTER TABLE storage ADD COLUMN item_cost_rm REAL")
+            if "total_quantity" not in cols:
+                cur.execute("ALTER TABLE storage ADD COLUMN total_quantity INTEGER")
+            if "total_in" not in cols:
+                cur.execute("ALTER TABLE storage ADD COLUMN total_in INTEGER")
+            if "total_out" not in cols:
+                cur.execute("ALTER TABLE storage ADD COLUMN total_out INTEGER")
+        except Exception:
+            pass
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS task_reports (
@@ -769,6 +881,59 @@ def _ensure_tables_in_main_db() -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def load_task_table() -> pd.DataFrame:
+    """Load task entries from main_data.db (task table)."""
+    if not ensure_main_database() or not MAIN_DB_FILE.exists():
+        return pd.DataFrame(columns=TASK_COLUMNS)
+
+    conn = _connect_main_db()
+    try:
+        if not _table_exists(conn, TASK_TABLE):
+            return pd.DataFrame(columns=TASK_COLUMNS)
+        df = pd.read_sql_query(f'SELECT * FROM "{TASK_TABLE}"', conn)
+    except Exception:
+        return pd.DataFrame(columns=TASK_COLUMNS)
+    finally:
+        conn.close()
+
+    for col in TASK_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[TASK_COLUMNS]
+
+
+def save_task_table(df: pd.DataFrame) -> bool:
+    """Replace the task table with the provided dataframe."""
+    try:
+        if not ensure_main_database():
+            return False
+        if df is None or not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        df = df.copy()
+        for col in TASK_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[TASK_COLUMNS]
+
+        conn = _connect_main_db()
+        try:
+            df.to_sql(TASK_TABLE, conn, if_exists="replace", index=False)
+            conn.commit()
+            _checkpoint_main_db(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update task table")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        show_system_error("Failed to save task table.", e, context="save_task_table")
+        return False
 
 
 def get_next_department_id(dept_code: str, item_prefix: str) -> str:
@@ -831,7 +996,7 @@ def get_next_department_id(dept_code: str, item_prefix: str) -> str:
 def _migrate_legacy_into_main_db() -> None:
     """One-time best-effort migration into main_data.db.
 
-    - If assets/breakdown tables are empty, import from CSV.
+    - If asset table is empty, import from CSV.
     - If log/workshop tables are empty, copy from legacy DBs (if present).
     """
     _ensure_tables_in_main_db()
@@ -853,6 +1018,59 @@ def _migrate_legacy_into_main_db() -> None:
             df_src = pd.read_sql_query(f'SELECT * FROM "{table}"', src_conn)
             if df_src is None or df_src.empty:
                 return
+
+            if table == "storage":
+                # Normalize legacy workshop storage schema into v2 columns.
+                def _to_int_series(s: pd.Series) -> pd.Series:
+                    return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
+
+                out = pd.DataFrame()
+                out["part_number"] = df_src.get("part_number", "").astype(str)
+                out["part_type"] = df_src.get("part_type", "").astype(str)
+                out["item_name"] = df_src.get("item_name", "").astype(str)
+                out["brand"] = df_src.get("brand", "").astype(str)
+                out["model"] = df_src.get("model", "").astype(str)
+                out["specification"] = df_src.get("specification", "").astype(str)
+                out["preferred_supplier"] = df_src.get("preferred_supplier", "").astype(str)
+                out["item_cost_rm"] = pd.to_numeric(df_src.get("item_cost_rm", 0), errors="coerce").fillna(0.0)
+                if "usage_area" in df_src.columns:
+                    out["usage_area"] = df_src.get("usage_area", "").astype(str)
+                else:
+                    out["usage_area"] = df_src.get("usage", "").astype(str)
+
+                has_legacy_totals = ("total_add" in df_src.columns) or ("total_used" in df_src.columns)
+                if has_legacy_totals:
+                    legacy_add = _to_int_series(df_src.get("total_add", 0)).clip(lower=0)
+                    legacy_used = _to_int_series(df_src.get("total_used", 0)).clip(lower=0)
+                    out_qty = legacy_used
+                    avail_qty = legacy_add
+                    out["total_quantity"] = avail_qty
+                    out["total_out"] = out_qty
+                    out["total_in"] = (out_qty + avail_qty).astype(int)
+                else:
+                    avail_qty = _to_int_series(df_src.get("total_quantity", 0)).clip(lower=0)
+                    out_qty = _to_int_series(df_src.get("total_out", 0)).clip(lower=0)
+                    out["total_quantity"] = avail_qty
+                    out["total_out"] = out_qty
+                    out["total_in"] = (out_qty + avail_qty).astype(int)
+
+                df_src = out[
+                    [
+                        "part_number",
+                        "part_type",
+                        "item_name",
+                        "brand",
+                        "model",
+                        "specification",
+                        "preferred_supplier",
+                        "item_cost_rm",
+                        "total_quantity",
+                        "usage_area",
+                        "total_in",
+                        "total_out",
+                    ]
+                ].copy()
+
             # Append into existing dest table
             df_src.to_sql(table, dest_conn, if_exists="append", index=False)
         except Exception:
@@ -919,7 +1137,7 @@ def log_asset_operation(action: str, department_id: str, asset_number: str,
         conn = _connect_main_db()
         try:
             cursor = conn.cursor()
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = format_ts_sg()
 
             cursor.execute(
                 """
@@ -967,8 +1185,16 @@ def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
         show_system_error("Failed to read asset logs.", e, context="get_asset_logs")
         return None
 
+def _cache_key_sg_day() -> str:
+    # Used to make cache refresh at Singapore midnight.
+    try:
+        return today_sg().isoformat()
+    except Exception:
+        return str(date.today().isoformat())
+
+
 @st.cache_data
-def load_existing_data() -> Optional[pd.DataFrame]:
+def _load_existing_data_cached(_day_key: str) -> Optional[pd.DataFrame]:
     try:
         if not ensure_main_database():
             return None
@@ -1005,6 +1231,11 @@ def load_existing_data() -> Optional[pd.DataFrame]:
         show_system_error("Failed to load asset data.", e, context="load_existing_data")
         return None
 
+
+def load_existing_data() -> Optional[pd.DataFrame]:
+    """Load asset data and keep derived fields fresh daily (Singapore time)."""
+    return _load_existing_data_cached(_cache_key_sg_day())
+
 def save_data(df: pd.DataFrame) -> bool:
     try:
         if not ensure_main_database():
@@ -1040,7 +1271,7 @@ def save_data(df: pd.DataFrame) -> bool:
             pass
 
         try:
-            load_existing_data.clear()
+            _load_existing_data_cached.clear()
         except Exception:
             pass
 
@@ -1079,7 +1310,7 @@ def delete_asset_by_dept_id(department_id: str) -> bool:
 
         if deleted > 0:
             try:
-                load_existing_data.clear()
+                _load_existing_data_cached.clear()
             except Exception:
                 pass
 
@@ -1090,92 +1321,6 @@ def delete_asset_by_dept_id(department_id: str) -> bool:
         return deleted > 0
     except Exception as e:
         show_system_error("Failed to delete asset.", e, context="delete_asset_by_dept_id")
-        return False
-
-
-def load_breakdown_report() -> pd.DataFrame:
-    """Load breakdown report from main_data.db (breakdown_report table)."""
-    if not ensure_main_database() or not MAIN_DB_FILE.exists():
-        return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
-
-    conn = _connect_main_db()
-    try:
-        if not _table_exists(conn, BREAKDOWN_TABLE):
-            return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
-        df = pd.read_sql_query(f'SELECT * FROM "{BREAKDOWN_TABLE}"', conn)
-    except Exception:
-        return pd.DataFrame(columns=BREAKDOWN_COLUMNS)
-    finally:
-        conn.close()
-
-    for col in BREAKDOWN_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-
-    # Approval workflow normalization:
-    # Legacy values: Pending/Approved/blank
-    # Current values: Completed/Close
-    if "Approval Status" in df.columns:
-        def _norm_approval(v: object) -> str:
-            s = str(v or "").strip()
-            if not s or s.casefold() in {"none", "nan"}:
-                return "Completed"
-            key = s.casefold()
-            if key in {"inprogress", "in progress", "in_progress"}:
-                return "InProgress"
-            if key == "pending":
-                return "Completed"
-            if key == "approved":
-                return "Approved"
-            if key in {"close", "closed"}:
-                return "Approved"
-            if key == "completed":
-                return "Completed"
-            return s
-
-        try:
-            df["Approval Status"] = df["Approval Status"].map(_norm_approval)
-        except Exception:
-            pass
-    return df[BREAKDOWN_COLUMNS]
-
-
-def save_breakdown_report(df: pd.DataFrame) -> bool:
-    """Replace the breakdown_report table with the provided dataframe."""
-    try:
-        if not ensure_main_database():
-            return False
-        if df is None or not isinstance(df, pd.DataFrame):
-            df = pd.DataFrame()
-        df = df.copy()
-        for col in BREAKDOWN_COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-        df = df[BREAKDOWN_COLUMNS]
-
-        conn = _connect_main_db()
-        try:
-            df.to_sql(BREAKDOWN_TABLE, conn, if_exists="replace", index=False)
-            conn.commit()
-            _checkpoint_main_db(conn)
-            conn.commit()
-        finally:
-            conn.close()
-
-        # Git-friendly export (best-effort)
-        try:
-            ensure_data_directory()
-            df.to_csv(BREAKDOWN_EXPORT_CSV, index=False)
-        except Exception:
-            pass
-
-        try:
-            persist_repo_changes([str(MAIN_DB_FILE), str(BREAKDOWN_EXPORT_CSV)], reason="Update breakdown report")
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        show_system_error("Failed to save breakdown report.", e, context="save_breakdown_report")
         return False
 
 def check_duplicate(asset_number: str, existing_df: Optional[pd.DataFrame]) -> bool:
@@ -1228,7 +1373,7 @@ def calculate_due_date(start_date: date, maintenance_frequency: str) -> Optional
 def calculate_days_left(due_date) -> Optional[int]:
     if not due_date:
         return None
-    today = date.today()
+    today = today_sg()
     if isinstance(due_date, datetime):
         due = due_date.date()
     elif isinstance(due_date, date):
@@ -1413,16 +1558,24 @@ def generate_acronym(description: str, max_length: int = 5) -> str:
 # REGDATA (LOGIN) HELPERS – flexible schema discovery
 # ======================================
 _LEVEL_RANK = {
-    "user": 1,
-    "operator": 1,
-    "staff": 1,
-    "tech": 1,
-    "technician": 1,
-    "superuser": 2,
-    "super_user": 2,
-    "super": 2,
-    "admin": 3,
-    "administrator": 3,
+    # 2026-03 roles (highest -> lowest): MasterUser, SuperUser, User, Viewer
+    "viewer": 1,
+    "view": 1,
+    "guest": 1,
+    "user": 2,
+    "operator": 2,
+    "staff": 2,
+    "tech": 2,
+    "technician": 2,
+    "superuser": 3,
+    "super_user": 3,
+    "super": 3,
+    "masteruser": 4,
+    "master_user": 4,
+    "master": 4,
+    # Legacy admin -> treat as highest
+    "admin": 4,
+    "administrator": 4,
 }
 
 
@@ -1431,14 +1584,18 @@ def _rank_from_level(value) -> int:
         return 0
     v = str(value).strip().lower()
     # be forgiving on many schemas
+    if "master" in v:
+        return 4
     if "admin" in v:
-        return 3
+        return 4
     if "super" in v:
-        return 2
+        return 3
+    if "view" in v:
+        return 1
     if v in _LEVEL_RANK:
         return int(_LEVEL_RANK[v])
     if "user" in v or "staff" in v or "operator" in v or "tech" in v:
-        return 1
+        return 2
     return 0
 
 
@@ -1465,6 +1622,7 @@ def _discover_regdata_layout(db_path_str: str):
         user_candidates = {"userid", "user_id", "user id", "employeeid", "empid"}
         qr_candidates = {"qrid", "qr_id", "qr id", "qrcode", "qr_code", "badge", "badgeid"}
         level_candidates = {"userlevel", "user_level", "user level", "level", "role", "access_level", "access level"}
+        position_candidates = {"position", "job_position", "job position", "designation", "title"}
         is_super_candidates = {"issuperuser", "is_superuser", "superuser", "super_user"}
         name_candidates = {"name", "username", "user_name", "full_name", "fullname", "staff_name", "employee_name"}
 
@@ -1482,6 +1640,7 @@ def _discover_regdata_layout(db_path_str: str):
                 continue
 
             level_col = next((col_norm[n] for n in level_candidates if n in col_norm), None)
+            position_col = next((col_norm[n] for n in position_candidates if n in col_norm), None)
             is_super_col = next((col_norm[n] for n in is_super_candidates if n in col_norm), None)
             name_col = next((col_norm[n] for n in name_candidates if n in col_norm), None)
 
@@ -1490,6 +1649,7 @@ def _discover_regdata_layout(db_path_str: str):
                 "user_col": user_col,
                 "qr_col": qr_col,
                 "level_col": level_col,
+                "position_col": position_col,
                 "is_super_col": is_super_col,
                 "name_col": name_col,
             }
@@ -1526,6 +1686,7 @@ def lookup_regdata_user(identifier: str, *, allow_userid: bool = True, allow_qr:
     user_col = layout.get("user_col")
     qr_col = layout.get("qr_col")
     level_col = layout.get("level_col")
+    position_col = layout.get("position_col")
     is_super_col = layout.get("is_super_col")
     name_col = layout.get("name_col")
 
@@ -1573,24 +1734,36 @@ def lookup_regdata_user(identifier: str, *, allow_userid: bool = True, allow_qr:
             if n:
                 display_name = n
 
-        level_name = ""
-        level_rank = 1
+        position_name = ""
+        if position_col and position_col in rec and rec[position_col] is not None:
+            position_name = str(rec[position_col]).strip()
+
+        level_value = ""
         if level_col and level_col in rec and rec[level_col] is not None:
-            level_name = str(rec[level_col]).strip()
-            level_rank = max(level_rank, _rank_from_level(level_name))
+            level_value = str(rec[level_col]).strip()
+
+        # Rank should reflect access role, but some schemas store role in `level`
+        # and job title in `position`. To be robust, consider both.
+        rank_from_position = _rank_from_level(position_name) if position_name else 0
+        rank_from_level = _rank_from_level(level_value) if level_value else 0
+
+        level_rank = max(1, rank_from_position, rank_from_level)
+        # Keep `level_name` as the access role label when available.
+        level_name = level_value or position_name
 
         if is_super_col and is_super_col in rec and rec[is_super_col] is not None:
             v = str(rec[is_super_col]).strip().lower()
             is_super = v in {"1", "true", "yes", "y", "t"} or rec[is_super_col] is True
             if is_super:
                 level_name = level_name or "SuperUser"
-                level_rank = max(level_rank, 2)
+                level_rank = max(level_rank, 3)
 
         return {
             "ok": True,
             "error": "",
             "user_id": user_id or identifier,
             "display_name": display_name or (user_id or identifier),
+            "position": position_name,
             "level_name": level_name,
             "level_rank": int(level_rank),
         }
@@ -1653,17 +1826,21 @@ def list_regdata_display_names() -> list[str]:
 
 
 def require_login(*, min_level_rank: int = 1) -> dict:
-    """Require a user to be authenticated (based on regdata.db) before continuing.
+    """Require a user to be authenticated (based on regdata.db) before continuing."""
+    return login_sidebar(min_level_rank=min_level_rank, required=True)
 
-    Renders a sidebar login form and stops the app if not authenticated.
-    On success, stores identity in st.session_state:
-      auth_ok, auth_user_id, auth_name, auth_level_name, auth_level_rank
+
+def login_sidebar(*, min_level_rank: int = 1, required: bool = False) -> dict:
+    """Render sidebar login UI and return auth context.
+
+    - When required=False: allows guest access (does not stop the app).
+    - When required=True: stops the app if not authenticated.
     """
-    # Initialize
     defaults = {
         "auth_ok": False,
         "auth_user_id": "",
         "auth_name": "",
+        "auth_position": "",
         "auth_level_name": "",
         "auth_level_rank": 0,
     }
@@ -1678,8 +1855,8 @@ def require_login(*, min_level_rank: int = 1) -> dict:
 
         if st.session_state.get("auth_ok"):
             name = st.session_state.get("auth_name") or st.session_state.get("auth_user_id")
-            lvl = st.session_state.get("auth_level_name")
-            st.success(f"Signed in: {name}" + (f" ({lvl})" if lvl else ""))
+            pos = str(st.session_state.get("auth_position", "") or "").strip()
+            st.success(f"Signed in: {name}" + (f" | {pos}" if pos else ""))
             if st.button("Logout", use_container_width=True):
                 for k in list(defaults.keys()):
                     st.session_state[k] = defaults[k]
@@ -1726,21 +1903,87 @@ def require_login(*, min_level_rank: int = 1) -> dict:
                     st.session_state.auth_ok = True
                     st.session_state.auth_user_id = res.get("user_id", "")
                     st.session_state.auth_name = res.get("display_name", "")
+                    st.session_state.auth_position = res.get("position", "")
                     st.session_state.auth_level_name = res.get("level_name", "")
                     st.session_state.auth_level_rank = int(res.get("level_rank") or 0)
                     st.rerun()
 
-    if not st.session_state.get("auth_ok"):
+    if required and not st.session_state.get("auth_ok"):
         st.info("Please login from the sidebar to use this dashboard.")
         st.stop()
 
+    ok = bool(st.session_state.get("auth_ok"))
     return {
-        "ok": True,
-        "user_id": st.session_state.get("auth_user_id", ""),
-        "name": st.session_state.get("auth_name", ""),
-        "level_name": st.session_state.get("auth_level_name", ""),
-        "level_rank": int(st.session_state.get("auth_level_rank") or 0),
+        "ok": ok,
+        "user_id": st.session_state.get("auth_user_id", "") if ok else "",
+        "name": st.session_state.get("auth_name", "") if ok else "",
+        "position": st.session_state.get("auth_position", "") if ok else "",
+        "level_name": st.session_state.get("auth_level_name", "") if ok else "",
+        "level_rank": int(st.session_state.get("auth_level_rank") or 0) if ok else 0,
     }
+
+
+def render_role_navigation(auth: dict | None = None) -> None:
+    """Render a role-based navigation menu in the sidebar.
+
+    Intended to be used with Streamlit's built-in sidebar navigation hidden.
+    """
+    try:
+        ctx = auth or {
+            "ok": bool(st.session_state.get("auth_ok")),
+            "level_rank": int(st.session_state.get("auth_level_rank") or 0),
+        }
+        ok = bool(ctx.get("ok"))
+        rank = int(ctx.get("level_rank") or 0)
+    except Exception:
+        ok = False
+        rank = 0
+
+    # Visible pages per role:
+    # - Guest: Home + Asset Catalogue
+    # - Viewer: Page 1, 2, 5 (+ Home)
+    # - User/SuperUser/MasterUser: all pages
+    # - MasterUser: also Page 6
+    pages: list[tuple[str, str, int]] = [
+        ("🏠 Home", "Home.py", 0),
+        ("📘 Asset Catalogue", "pages/1_AssetCatalogue.py", 0),
+    ]
+
+    if ok:
+        pages.extend(
+            [
+                ("📝 Asset Editor", "pages/2_AssetEditor.py", 2),
+                ("🔧 Task Update", "pages/3_TaskUpdate.py", 2),
+                ("🏭 Workshop Inventory", "pages/4_WorkshopInventory.py", 2),
+                ("🛠️ Maintenance Request", "pages/5_MaintenanceRequest.py", 1),
+                ("👑 MasterUser Editor", "pages/6_MasterUserEditor.py", 4),
+            ]
+        )
+
+    # Viewer restriction: only show pages 1,5 (plus Home)
+    if ok and rank == 1:
+        allowed = {"Home.py", "pages/1_AssetCatalogue.py", "pages/5_MaintenanceRequest.py"}
+        pages = [p for p in pages if p[1] in allowed]
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧭 Navigation")
+
+    for label, path, min_rank in pages:
+        if ok and rank < int(min_rank):
+            continue
+        if hasattr(st.sidebar, "page_link"):
+            try:
+                st.sidebar.page_link(path, label=label)
+                continue
+            except Exception:
+                # Fall back to buttons below.
+                pass
+
+        if st.sidebar.button(label, use_container_width=True, key=f"nav_{path}"):
+            try:
+                st.switch_page(path)
+            except Exception:
+                pass
 
 def filter_dataframe(df: pd.DataFrame, search_term: str) -> pd.DataFrame:
     """Filter dataframe by search term across multiple columns"""
@@ -1852,7 +2095,7 @@ def log_stock_operation(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                format_ts_sg(),
                 str(action),
                 str(part_number),
                 int(qty),
@@ -1892,6 +2135,19 @@ def initialize_inventory_history_database() -> None:
             )
             """
         )
+
+        # Best-effort schema migration for older DBs
+        cur.execute("PRAGMA table_info(inventory_history)")
+        cols = {r[1] for r in (cur.fetchall() or [])}
+        if "performed_by" not in cols:
+            cur.execute("ALTER TABLE inventory_history ADD COLUMN performed_by TEXT")
+        if "note" not in cols:
+            cur.execute("ALTER TABLE inventory_history ADD COLUMN note TEXT")
+        if "before_state" not in cols:
+            cur.execute("ALTER TABLE inventory_history ADD COLUMN before_state TEXT")
+        if "after_state" not in cols:
+            cur.execute("ALTER TABLE inventory_history ADD COLUMN after_state TEXT")
+
         conn.commit()
     finally:
         conn.close()
@@ -1931,7 +2187,7 @@ def log_inventory_history(
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    format_ts_sg(),
                     str(action or ""),
                     str(part_number or ""),
                     str(performed_by or ""),

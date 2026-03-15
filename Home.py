@@ -4,10 +4,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import re
-from utils import load_existing_data, load_breakdown_report, require_login, show_system_error
+from utils import load_existing_data, load_task_table, login_sidebar, render_role_navigation, show_system_error
 
 st.set_page_config(page_title="ME Dashboard", page_icon="📊", layout="wide")
-require_login()
+auth = login_sidebar(required=False)
+render_role_navigation(auth)
 st.title("📊 ME Asset List")
 
 # ======================================
@@ -96,14 +97,18 @@ st.markdown("---")
 st.markdown("## 🛠️ Task Report Analysis")
 
 try:
-    tdf = load_breakdown_report()
+    tdf = load_task_table()
 
     if tdf is None or tdf.empty:
-        st.info("No breakdown report data found yet.")
+        st.info("No task report data found yet.")
     else:
 
         job_type_col = "Job Type" if "Job Type" in tdf.columns else ("Task Type" if "Task Type" in tdf.columns else None)
-        duration_col = "Duration" if "Duration" in tdf.columns else None
+        duration_col = None
+        for c in ["Duration report", "Duration E", "Duration"]:
+            if c in tdf.columns:
+                duration_col = c
+                break
 
         def _duration_to_minutes(value):
             # Keeps compatibility with minutes, HH:MM:SS / MM:SS, and common legacy text formats.
@@ -158,6 +163,8 @@ try:
                 return "Breakdown"
             if "maint" in v:
                 return "Maintenance"
+            if "general" in v:
+                return "General"
             return ""
 
         # =====================
@@ -339,4 +346,4 @@ try:
             )
 
 except Exception as e:
-    show_system_error("Failed to load/plot breakdown report data.", e, context="Home.TaskReport")
+    show_system_error("Failed to load/plot task report data.", e, context="Home.TaskReport")
