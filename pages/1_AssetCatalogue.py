@@ -5,9 +5,8 @@ import re
 from utils import (
     load_existing_data,
     filter_dataframe,
-    require_login,
-    decode_qr_payload_from_image,
-    uploaded_file_sha256,
+    login_sidebar,
+    render_role_navigation,
 )
 
 # --------------------------------------------------
@@ -19,7 +18,8 @@ st.set_page_config(
     layout="wide"
 )
 
-require_login()
+auth = login_sidebar(required=False)
+render_role_navigation(auth)
 
 st.title("📘 Asset List")
 
@@ -165,37 +165,8 @@ with search_col2:
         st.rerun()
 
 st.caption("Scan via camera or a handheld QR scanner.")
-qr_mode = st.radio(
-    "Scan method",
-    options=["QR scanner", "Camera"],
-    horizontal=True,
-    key="catalog_qr_mode",
-    label_visibility="collapsed",
-)
 
-if qr_mode == "QR scanner":
-    scanned = st.text_input(
-        "QR scanner input",
-        placeholder="Click here then scan (scanner types + Enter)",
-        key="catalog_qr_scanner",
-        label_visibility="collapsed",
-    )
-    scanned = str(scanned or "").strip()
-    if scanned and st.session_state.get("catalog_qr_scanner_last") != scanned:
-        st.session_state["catalog_qr_scanner_last"] = scanned
-        st.session_state["catalog_search_term"] = scanned
-        st.rerun()
-else:
-    cam = st.camera_input("Scan QR and search", key="catalog_qr_cam")
-    digest = uploaded_file_sha256(cam)
-    if cam is not None and digest and st.session_state.get("catalog_qr_cam_digest") != digest:
-        st.session_state["catalog_qr_cam_digest"] = digest
-        payload = decode_qr_payload_from_image(cam)
-        if payload:
-            st.session_state["catalog_search_term"] = payload
-            st.rerun()
-        else:
-            st.warning("No QR detected. Try again with a clearer shot.")
+# QR/camera scan removed (search bar only)
 
 st.markdown("---")
 

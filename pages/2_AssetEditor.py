@@ -11,14 +11,16 @@ from utils import (
     calculate_status, validate_equipment_details,
     generate_acronym, log_asset_operation, get_asset_logs, initialize_log_database,
     delete_asset_by_dept_id, require_login,
-    decode_qr_payload_from_image, uploaded_file_sha256,
     get_next_department_id,
     recompute_asset_derived_fields,
     persist_repo_changes,
+    today_sg,
     show_user_error,
+    render_role_navigation,
 )
 
-auth = require_login()
+auth = require_login(min_level_rank=2)
+render_role_navigation(auth)
 
 
 def _performed_by_label() -> str:
@@ -445,7 +447,7 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     with col18:
         start_date_val = st.date_input(
             "Start Date",
-            value=_safe_parse_date(record.get("Start Date"), fallback=date.today()) or date.today(),
+            value=_safe_parse_date(record.get("Start Date"), fallback=today_sg()) or today_sg(),
             key=f"{prefix}_start_date",
         )
 
@@ -459,7 +461,7 @@ def render_equipment_form(prefix: str, record: dict | None = None, is_update: bo
     with col19:
         # Show computed due date in maintenance mode; show stored/manual in calibration mode.
         due_date_widget_default = (rec_due_date or auto_due_date) if calib_required else (auto_due_date or rec_due_date)
-        due_date_widget_default = due_date_widget_default or date.today()
+        due_date_widget_default = due_date_widget_default or today_sg()
         # When disabled (maintenance mode), force-refresh the widget value.
         if not calib_required:
             try:
@@ -786,12 +788,12 @@ st.markdown("---")
 # ================= ROW 2: UPDATE ASSET DATABASE =================
 st.markdown("### ✏️ Update Asset Database")
 
-# Row 1: Search bar (Department ID / Asset Number / SAP No.)
+# Row 1: Search bar (Department ID / Asset Number / SAP No. / Description)
 search_col1, search_col2 = st.columns([4, 1])
 with search_col1:
     search_text = st.text_input(
-        "Search (Department ID / Asset Number / SAP No.)",
-        placeholder="Type Department ID or Asset Number or SAP No. (e.g. 88-15ME-ABC-001 / A-0001 / 5100001234)",
+        "Search (Department ID / Asset Number / SAP No. / Name)",
+        placeholder="Type Department ID / Asset Number / SAP No. / Equipment Name (e.g. 88-15ME-ABC-001 / A-0001 / 5100001234 / COMPRESSOR)",
         label_visibility="collapsed",
         key="search_asset_text",
     )
@@ -799,38 +801,7 @@ with search_col2:
     if st.button("🔍 Find", use_container_width=True):
         st.rerun()
 
-st.caption("Scan via camera or a handheld QR scanner.")
-qr_mode = st.radio(
-    "Scan method",
-    options=["QR scanner", "Camera"],
-    horizontal=True,
-    key="editor_qr_mode",
-    label_visibility="collapsed",
-)
-
-if qr_mode == "QR scanner":
-    scanned = st.text_input(
-        "QR scanner input",
-        placeholder="Click here then scan (scanner types + Enter)",
-        key="editor_qr_scanner",
-        label_visibility="collapsed",
-    )
-    scanned = str(scanned or "").strip()
-    if scanned and st.session_state.get("editor_qr_scanner_last") != scanned:
-        st.session_state["editor_qr_scanner_last"] = scanned
-        st.session_state["search_asset_text"] = scanned
-        st.rerun()
-else:
-    cam = st.camera_input("Scan QR and fill search", key="editor_qr_cam")
-    digest = uploaded_file_sha256(cam)
-    if cam is not None and digest and st.session_state.get("editor_qr_cam_digest") != digest:
-        st.session_state["editor_qr_cam_digest"] = digest
-        payload = decode_qr_payload_from_image(cam)
-        if payload:
-            st.session_state["search_asset_text"] = payload
-            st.rerun()
-        else:
-            st.warning("No QR detected. Try again with a clearer shot.")
+# QR/camera scan removed (search only)
 
 # Load fresh data
 existing_df = load_existing_data()
@@ -839,7 +810,7 @@ if existing_df is None or existing_df.empty:
     st.info("📝 No assets registered yet.")
 else:
     # Columns to search (only use those that exist)
-    candidate_cols = ["Department ID", "Asset Number", "SAP No."]
+    candidate_cols = ["Department ID", "Asset Number", "SAP No.", "Description of Asset"]
     search_cols = [c for c in candidate_cols if c in existing_df.columns]
 
     if not search_cols:
@@ -1033,8 +1004,8 @@ else:
                 with col_confirm:
                     if st.button("🔴 DELETE PERMANENTLY", type="primary", use_container_width=True):
                         # Only rely on current login clearance (no second verification)
-                        if _current_user_level_rank() < 2:
-                            st.error("Access denied: requires SuperUser/Admin clearance.")
+                        if _current_user_level_rank() < 3:
+                            st.error("Access denied: requires SuperUser clearance.")
                             st.stop()
 
                         dept_id_to_delete = st.session_state.get("delete_confirm_dept_id", "")
@@ -1080,148 +1051,6 @@ else:
                         st.rerun()
     else:
         st.info("📝 No assets available to update.")
-
-# ================= BULK UPDATE: REQUIRE CALIBRATION =================
-st.markdown("---")
-with st.expander("🧰 Bulk Update: Require Calibration", expanded=False):
-    existing_df = load_existing_data()
-    if existing_df is None or existing_df.empty:
-        st.info("📝 No assets available.")
-    else:
-        st.caption("Tick rows to update. Tick 'Require Calibration' to set Yes; untick to set No.")
-
-        bulk_filter = st.text_input(
-            "Filter (optional)",
-            placeholder="Filter by Department ID / Asset Number / Description...",
-            key="bulk_calib_filter",
-        )
-
-        view_df = existing_df.copy()
-        if "Require Calibration" not in view_df.columns:
-            view_df["Require Calibration"] = "No"
-
-        if bulk_filter:
-            q = str(bulk_filter or "").strip()
-            if q:
-                cols = [c for c in ["Department ID", "Asset Number", "Description of Asset"] if c in view_df.columns]
-                if cols:
-                    mask = None
-                    for c in cols:
-                        m = view_df[c].astype(str).str.contains(q, case=False, na=False)
-                        mask = m if mask is None else (mask | m)
-                    if mask is not None:
-                        view_df = view_df[mask].copy()
-
-        bulk_set_yes = st.checkbox(
-            "Require Calibration (tick = Yes)",
-            value=True,
-            key="bulk_calib_set_yes",
-        )
-
-        editor_df = view_df.copy()
-        editor_df.insert(0, "Select", False)
-        editor_df.insert(1, "Row Index", editor_df.index)
-
-        show_cols = [
-            "Select",
-            "Row Index",
-            "Department ID",
-            "Asset Number",
-            "Description of Asset",
-            "Require Calibration",
-            "Maintenance Frequency",
-            "Start Date",
-            "Due Date",
-            "Day Left",
-            "Status",
-        ]
-        show_cols = [c for c in show_cols if c in editor_df.columns]
-        editor_df = editor_df[show_cols]
-
-        edited = st.data_editor(
-            editor_df,
-            hide_index=True,
-            use_container_width=True,
-            disabled=[c for c in editor_df.columns if c != "Select"],
-            key="bulk_calib_editor",
-        )
-
-        selected_row_ids = []
-        try:
-            selected_row_ids = edited.loc[edited["Select"] == True, "Row Index"].tolist()  # noqa: E712
-        except Exception:
-            selected_row_ids = []
-
-        if st.button("✅ Apply Bulk Update", type="primary", use_container_width=True, key="bulk_calib_apply"):
-            if not selected_row_ids:
-                st.warning("Select at least one row.")
-            else:
-                updated_df = load_existing_data()
-                if updated_df is None or updated_df.empty:
-                    st.error("No data loaded.")
-                    st.stop()
-
-                target_val = "Yes" if bulk_set_yes else "No"
-                changed = 0
-
-                for rid in selected_row_ids:
-                    if rid not in updated_df.index:
-                        continue
-
-                    updated_df.at[rid, "Require Calibration"] = target_val
-
-                    func_loc_norm = str(updated_df.at[rid, "Functional Location"] if "Functional Location" in updated_df.columns else "")
-                    func_loc_norm = str(func_loc_norm or "").strip()
-
-                    if bulk_set_yes:
-                        # Calibration required: only toggle the flag.
-                        # Due Date / Day Left remain as-is (typically calibration schedule).
-                        pass
-                    else:
-                        # Calibration not required: best-effort recompute due date/day left/status
-                        start_raw = updated_df.at[rid, "Start Date"] if "Start Date" in updated_df.columns else None
-                        freq_raw = updated_df.at[rid, "Maintenance Frequency"] if "Maintenance Frequency" in updated_df.columns else None
-
-                        start_dt = _safe_parse_date(start_raw, fallback=None)
-                        due_dt = _safe_calc_due_date(start_dt, str(freq_raw or "").strip()) if start_dt else None
-                        if due_dt and "Due Date" in updated_df.columns:
-                            updated_df.at[rid, "Due Date"] = due_dt.strftime("%Y-%m-%d")
-                        if "Day Left" in updated_df.columns:
-                            updated_df.at[rid, "Day Left"] = _safe_calc_days_left(due_dt) if due_dt else ""
-
-                        # Apply the same Status rules as the form (including expiry when possible).
-                        if "Status" in updated_df.columns:
-                            days_left_val = updated_df.at[rid, "Day Left"] if "Day Left" in updated_df.columns else ""
-                            days_left_int = None
-                            try:
-                                if days_left_val is not None and str(days_left_val).strip() != "":
-                                    days_left_int = int(float(str(days_left_val).strip()))
-                            except Exception:
-                                days_left_int = None
-
-                            if func_loc_norm == "Obsolete":
-                                updated_df.at[rid, "Status"] = "Obsolete"
-                            elif days_left_int is None:
-                                # Don't override existing Status when we can't derive Day Left.
-                                pass
-                            elif days_left_int is not None and days_left_int <= 0:
-                                updated_df.at[rid, "Status"] = "Expired"
-                            elif days_left_int is not None and days_left_int < 7:
-                                updated_df.at[rid, "Status"] = "Expired Soon"
-                            elif func_loc_norm == "1006-10PE":
-                                updated_df.at[rid, "Status"] = "Good"
-                            elif func_loc_norm:
-                                updated_df.at[rid, "Status"] = "Idle"
-
-                    changed += 1
-
-                if changed == 0:
-                    st.warning("No matching rows were updated.")
-                elif save_data(updated_df):
-                    st.success(f"✅ Bulk updated {changed} asset(s).")
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to save bulk updates.")
 
 # ================= MAINTENANCE: RECALCULATE DERIVED FIELDS =================
 st.markdown("---")

@@ -12,11 +12,13 @@ from utils import (
     log_inventory_history,
     persist_repo_changes,
     require_login,
+    render_role_navigation,
 )
 
 st.set_page_config(page_title="Workshop Inventory", page_icon="🏭", layout="wide")
 
-auth = require_login()
+auth = require_login(min_level_rank=2)
+render_role_navigation(auth)
 
 
 def _performed_by_label() -> str:
@@ -42,73 +44,143 @@ def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Storage Table
-    # Rule:
-    #   total_quantity = total_used + total_add
-    # where:
-    #   total_add  = current stock in store (available)
-    #   total_used = total issued/consumed
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS storage (
-            part_number TEXT PRIMARY KEY,
-            item_name TEXT,
-            brand TEXT,
-            model TEXT,
-            specification TEXT,
-            total_quantity INTEGER,
-            total_used INTEGER,
-            total_add INTEGER,
-            part_type TEXT,
-            usage TEXT
+    # Storage Table (v2)
+    # - total_quantity: current available stock
+    # - total_in: cumulative stock-in quantity
+    # - total_out: cumulative stock-out quantity
+    # Rule (normalized): total_in = total_out + total_quantity
+    desired_cols = [
+        ("part_number", "TEXT"),
+        ("part_type", "TEXT"),
+        ("item_name", "TEXT"),
+        ("brand", "TEXT"),
+        ("model", "TEXT"),
+        ("specification", "TEXT"),
+        ("preferred_supplier", "TEXT"),
+        ("item_cost_rm", "REAL"),
+        ("total_quantity", "INTEGER"),
+        ("usage_area", "TEXT"),
+        ("total_in", "INTEGER"),
+        ("total_out", "INTEGER"),
+    ]
+
+    c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='storage' LIMIT 1")
+    storage_exists = c.fetchone() is not None
+
+    def _create_storage_table(table_name: str) -> None:
+        c.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                part_number TEXT PRIMARY KEY,
+                part_type TEXT,
+                item_name TEXT,
+                brand TEXT,
+                model TEXT,
+                specification TEXT,
+                preferred_supplier TEXT,
+                item_cost_rm REAL,
+                total_quantity INTEGER,
+                usage_area TEXT,
+                total_in INTEGER,
+                total_out INTEGER
+            )
+            """
         )
-        """
-    )
 
-    # --- schema migration for existing DBs ---
+    if not storage_exists:
+        _create_storage_table("storage")
+        conn.commit()
+        conn.close()
+        return
+
+    # Decide whether a rebuild is needed (legacy/mismatched columns).
     c.execute("PRAGMA table_info(storage)")
-    cols = [r[1] for r in c.fetchall()]
+    existing_cols = [r[1] for r in (c.fetchall() or [])]
+    desired_names = [n for n, _t in desired_cols]
+    needs_rebuild = set(existing_cols) != set(desired_names)
 
-    if "usage" not in cols:
-        c.execute("ALTER TABLE storage ADD COLUMN usage TEXT")
-        c.execute("UPDATE storage SET usage = '' WHERE usage IS NULL")
-
-    if "brand" not in cols:
-        c.execute("ALTER TABLE storage ADD COLUMN brand TEXT")
-        c.execute("UPDATE storage SET brand = '' WHERE brand IS NULL")
-
-    if "model" not in cols:
-        c.execute("ALTER TABLE storage ADD COLUMN model TEXT")
-        c.execute("UPDATE storage SET model = '' WHERE model IS NULL")
-
-    if "total_add" not in cols:
-        c.execute("ALTER TABLE storage ADD COLUMN total_add INTEGER")
-        # Backfill:
-        # old logic used: available = total_quantity - total_used
-        # now store available into total_add
+    if not needs_rebuild:
+        # Normalize totals without rebuilding.
         c.execute(
             """
             UPDATE storage
-            SET total_add = COALESCE(total_quantity, 0) - COALESCE(total_used, 0)
-            WHERE total_add IS NULL
+            SET total_quantity = COALESCE(total_quantity, 0),
+                total_out = COALESCE(total_out, 0),
+                total_in = COALESCE(total_out, 0) + COALESCE(total_quantity, 0)
+            WHERE total_quantity IS NULL
+               OR total_out IS NULL
+               OR total_in IS NULL
+               OR total_in != (COALESCE(total_out, 0) + COALESCE(total_quantity, 0))
             """
         )
-        # Ensure non-negative
-        c.execute("UPDATE storage SET total_add = 0 WHERE total_add < 0 OR total_add IS NULL")
+        conn.commit()
+        conn.close()
+        return
 
-    # Normalize totals to match rule: total_quantity = total_used + total_add
-    c.execute(
-        """
-        UPDATE storage
-        SET total_used = COALESCE(total_used, 0),
-            total_add = COALESCE(total_add, 0),
-            total_quantity = COALESCE(total_used, 0) + COALESCE(total_add, 0)
-        WHERE total_quantity IS NULL
-           OR total_used IS NULL
-           OR total_add IS NULL
-           OR total_quantity != (COALESCE(total_used, 0) + COALESCE(total_add, 0))
-        """
-    )
+    # Migrate any legacy schema into the v2 schema (best-effort).
+    try:
+        df_old = pd.read_sql("SELECT * FROM storage", conn)
+    except Exception:
+        df_old = pd.DataFrame()
+
+    def _to_int_series(s: pd.Series) -> pd.Series:
+        return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
+
+    if df_old is None:
+        df_old = pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["part_number"] = df_old.get("part_number", "").astype(str)
+    out["part_type"] = df_old.get("part_type", "").astype(str)
+    out["item_name"] = df_old.get("item_name", "").astype(str)
+    out["brand"] = df_old.get("brand", "").astype(str)
+    out["model"] = df_old.get("model", "").astype(str)
+    out["specification"] = df_old.get("specification", "").astype(str)
+    out["preferred_supplier"] = df_old.get("preferred_supplier", "").astype(str)
+    out["item_cost_rm"] = pd.to_numeric(df_old.get("item_cost_rm", 0), errors="coerce").fillna(0.0)
+
+    if "usage_area" in df_old.columns:
+        out["usage_area"] = df_old.get("usage_area", "").astype(str)
+    else:
+        out["usage_area"] = df_old.get("usage", "").astype(str)
+
+    # Totals migration:
+    # - If old columns exist (total_add/total_used), map them to new.
+    # - Otherwise, keep new columns if already present.
+    has_legacy_totals = ("total_add" in df_old.columns) or ("total_used" in df_old.columns)
+    if has_legacy_totals:
+        legacy_add = _to_int_series(df_old.get("total_add", 0))
+        legacy_used = _to_int_series(df_old.get("total_used", 0))
+        out_qty = legacy_used.clip(lower=0)
+        avail_qty = legacy_add.clip(lower=0)
+        in_qty = (out_qty + avail_qty).astype(int)
+        out["total_out"] = out_qty
+        out["total_quantity"] = avail_qty
+        out["total_in"] = in_qty
+    else:
+        avail_qty = _to_int_series(df_old.get("total_quantity", 0)).clip(lower=0)
+        out_qty = _to_int_series(df_old.get("total_out", 0)).clip(lower=0)
+        in_qty = _to_int_series(df_old.get("total_in", (out_qty + avail_qty))).clip(lower=0)
+        # Normalize rule: total_in = total_out + total_quantity
+        in_qty = (out_qty + avail_qty).astype(int)
+        out["total_quantity"] = avail_qty
+        out["total_out"] = out_qty
+        out["total_in"] = in_qty
+
+    # Keep only desired columns and ensure they exist
+    for col, _typ in desired_cols:
+        if col not in out.columns:
+            out[col] = "" if _typ == "TEXT" else 0
+    out = out[[cname for cname, _ in desired_cols]].copy()
+
+    # Rebuild table to match the requested column set.
+    c.execute("DROP TABLE IF EXISTS storage__new")
+    _create_storage_table("storage__new")
+    if not out.empty:
+        out.to_sql("storage__new", conn, if_exists="append", index=False)
+
+    c.execute("DROP TABLE IF EXISTS storage")
+    c.execute("ALTER TABLE storage__new RENAME TO storage")
 
     conn.commit()
     conn.close()
@@ -118,6 +190,8 @@ PART_TYPE_CONFIG = {
     "Electrical": {"type_code": "ELEC", "pn_prefix": "PN1"},
     "Mechanical": {"type_code": "MECH", "pn_prefix": "PN2"},
     "Pneumatic": {"type_code": "PNE", "pn_prefix": "PN3"},
+    "Hydraulic": {"type_code": "HYD", "pn_prefix": "PN4"},
+    "General Item": {"type_code": "GEN", "pn_prefix": "PN5"},
 }
 
 TYPE_CODE_TO_PN_PREFIX = {cfg["type_code"]: cfg["pn_prefix"] for cfg in PART_TYPE_CONFIG.values()}
@@ -129,18 +203,27 @@ def get_storage() -> pd.DataFrame:
     conn.close()
 
     # Ensure columns exist (for safety)
-    if "usage" not in df.columns:
-        df["usage"] = ""
+    if "usage_area" not in df.columns:
+        df["usage_area"] = ""
     if "brand" not in df.columns:
         df["brand"] = ""
     if "model" not in df.columns:
         df["model"] = ""
-    if "total_add" not in df.columns:
-        df["total_add"] = (df.get("total_quantity", 0) - df.get("total_used", 0)).clip(lower=0)
+    if "preferred_supplier" not in df.columns:
+        df["preferred_supplier"] = ""
+    if "item_cost_rm" not in df.columns:
+        df["item_cost_rm"] = 0.0
+    if "total_in" not in df.columns:
+        df["total_in"] = 0
+    if "total_out" not in df.columns:
+        df["total_out"] = 0
+    if "total_quantity" not in df.columns:
+        df["total_quantity"] = 0
 
-    df["total_quantity"] = (
-        df["total_used"].fillna(0).astype(int) + df["total_add"].fillna(0).astype(int)
-    ).astype(int)
+    # Normalize totals (display consistency)
+    df["total_quantity"] = pd.to_numeric(df["total_quantity"], errors="coerce").fillna(0).astype(int).clip(lower=0)
+    df["total_out"] = pd.to_numeric(df["total_out"], errors="coerce").fillna(0).astype(int).clip(lower=0)
+    df["total_in"] = (df["total_out"] + df["total_quantity"]).astype(int)
     return df
 
 
@@ -160,45 +243,108 @@ def _fetch_storage_row(conn: sqlite3.Connection, part_number: str) -> dict | Non
         return None
 
 
+def _diff_state_for_log(
+    before_state: dict | None,
+    after_state: dict | None,
+    *,
+    include_keys: list[str] | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Return (before, after) dicts containing only changed fields.
+
+    If include_keys is provided, only those keys are considered.
+    """
+    if not before_state and not after_state:
+        return None, None
+
+    before_state = dict(before_state or {})
+    after_state = dict(after_state or {})
+
+    keys = set(include_keys or (set(before_state.keys()) | set(after_state.keys())))
+
+    def _norm(v: object) -> object:
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return v
+        s = str(v).strip()
+        try:
+            # normalize numeric strings
+            if s != "" and s.replace(".", "", 1).isdigit():
+                if "." in s:
+                    return round(float(s), 2)
+                return int(s)
+        except Exception:
+            pass
+        return s
+
+    changed: list[str] = []
+    for k in keys:
+        if _norm(before_state.get(k)) != _norm(after_state.get(k)):
+            changed.append(k)
+
+    if not changed:
+        return None, None
+
+    return ({k: before_state.get(k, "") for k in changed}, {k: after_state.get(k, "") for k in changed})
+
+
 def save_part(
     part_number: str,
     item_name: str,
     specification: str,
-    total_add: int,
     part_type: str,
-    usage: str,
+    usage_area: str,
+    total_quantity: int,
     brand: str = "",
     model: str = "",
+    preferred_supplier: str = "",
+    item_cost_rm: float = 0.0,
     performed_by: str = "",
     note: str = "",
 ) -> None:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    total_add = int(total_add)
-    total_used = 0
-    total_quantity = total_used + total_add
+    total_quantity = int(total_quantity)
+    total_out = 0
+    total_in = total_out + max(total_quantity, 0)
 
     c.execute(
         """
-        INSERT INTO storage (part_number, item_name, brand, model, specification, total_quantity, total_used, total_add, part_type, usage)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO storage (
+            part_number,
+            part_type,
+            item_name,
+            brand,
+            model,
+            specification,
+            preferred_supplier,
+            item_cost_rm,
+            total_quantity,
+            usage_area,
+            total_in,
+            total_out
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             part_number,
+            str(part_type or "").strip(),
             item_name,
             str(brand or "").strip(),
             str(model or "").strip(),
             specification,
-            total_quantity,
-            total_used,
-            total_add,
-            part_type,
-            usage,
+            str(preferred_supplier or "").strip(),
+            float(item_cost_rm or 0.0),
+            int(max(total_quantity, 0)),
+            str(usage_area or "").strip(),
+            int(max(total_in, 0)),
+            int(max(total_out, 0)),
         ),
     )
     conn.commit()
 
     after_state = _fetch_storage_row(conn, part_number)
+    # ADD: keep full after_state so audit shows what was created.
     log_inventory_history(
         action="ADD_PART",
         part_number=part_number,
@@ -216,7 +362,7 @@ def save_part(
     conn.close()
 
 
-def _get_storage_totals(conn: sqlite3.Connection, part_number: str) -> tuple[int, int]:
+def _get_storage_totals(conn: sqlite3.Connection, part_number: str) -> tuple[int, int, int]:
     pn = str(part_number or "").strip()
     if not pn:
         raise ValueError("Part Number is required")
@@ -224,7 +370,7 @@ def _get_storage_totals(conn: sqlite3.Connection, part_number: str) -> tuple[int
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT COALESCE(total_used, 0), COALESCE(total_add, 0)
+        SELECT COALESCE(total_in, 0), COALESCE(total_out, 0), COALESCE(total_quantity, 0)
         FROM storage
         WHERE part_number = ?
         LIMIT 1
@@ -235,7 +381,7 @@ def _get_storage_totals(conn: sqlite3.Connection, part_number: str) -> tuple[int
     if not row:
         raise ValueError(f"Part not found: {pn}")
 
-    return int(row[0]), int(row[1])
+    return int(row[0]), int(row[1]), int(row[2])
 
 
 def stock_in_add(part_number: str, qty_in: int, performed_by: str = "", note: str = "") -> None:
@@ -246,38 +392,49 @@ def stock_in_add(part_number: str, qty_in: int, performed_by: str = "", note: st
     conn = sqlite3.connect(DB_PATH)
     try:
         before_state = _fetch_storage_row(conn, part_number)
-        before_used, before_add = _get_storage_totals(conn, part_number)
+        before_in, before_out, before_qty = _get_storage_totals(conn, part_number)
 
-        after_add = before_add + qty_in
-        after_used = before_used
-        after_qty = after_used + after_add
+        after_in = before_in + qty_in
+        after_out = before_out
+        after_qty = before_qty + qty_in
 
         cur = conn.cursor()
         cur.execute(
-            "UPDATE storage SET total_add = ?, total_quantity = ? WHERE part_number = ?",
-            (after_add, after_qty, part_number),
+            """
+            UPDATE storage
+            SET total_in = ?, total_out = ?, total_quantity = ?
+            WHERE part_number = ?
+            """,
+            (after_in, after_out, after_qty, part_number),
         )
         conn.commit()
 
         after_state = _fetch_storage_row(conn, part_number)
+
+        # Log only changed totals
+        b_diff, a_diff = _diff_state_for_log(
+            before_state,
+            after_state,
+            include_keys=["total_in", "total_out", "total_quantity"],
+        )
 
         log_inventory_history(
             action="IN_ADD",
             part_number=part_number,
             performed_by=performed_by,
             note=note,
-            before_state=before_state,
-            after_state=after_state,
+            before_state=b_diff,
+            after_state=a_diff,
         )
 
         log_stock_operation(
             action="IN_ADD",
             part_number=part_number,
             qty=qty_in,
-            before_total_add=before_add,
-            after_total_add=after_add,
-            before_total_used=before_used,
-            after_total_used=after_used,
+            before_total_add=before_qty,
+            after_total_add=after_qty,
+            before_total_used=before_out,
+            after_total_used=after_out,
             performed_by=performed_by,
             source="Stock IN/OUT",
             note=note,
@@ -299,40 +456,51 @@ def stock_out_adjust(part_number: str, qty_out: int, performed_by: str = "", not
     conn = sqlite3.connect(DB_PATH)
     try:
         before_state = _fetch_storage_row(conn, part_number)
-        before_used, before_add = _get_storage_totals(conn, part_number)
-        if qty_out > before_add:
+        before_in, before_out, before_qty = _get_storage_totals(conn, part_number)
+        if qty_out > before_qty:
             raise ValueError("Not enough available stock")
 
-        after_add = before_add - qty_out
-        after_used = before_used
-        after_qty = after_used + after_add
+        after_qty = before_qty - qty_out
+        after_out = before_out + qty_out
+        after_in = after_out + after_qty
 
         cur = conn.cursor()
         cur.execute(
-            "UPDATE storage SET total_add = ?, total_quantity = ? WHERE part_number = ?",
-            (after_add, after_qty, part_number),
+            """
+            UPDATE storage
+            SET total_in = ?, total_out = ?, total_quantity = ?
+            WHERE part_number = ?
+            """,
+            (after_in, after_out, after_qty, part_number),
         )
         conn.commit()
 
         after_state = _fetch_storage_row(conn, part_number)
+
+        # Log only changed totals
+        b_diff, a_diff = _diff_state_for_log(
+            before_state,
+            after_state,
+            include_keys=["total_in", "total_out", "total_quantity"],
+        )
 
         log_inventory_history(
             action="OUT_ADJUST",
             part_number=part_number,
             performed_by=performed_by,
             note=note,
-            before_state=before_state,
-            after_state=after_state,
+            before_state=b_diff,
+            after_state=a_diff,
         )
 
         log_stock_operation(
             action="OUT_ADJUST",
             part_number=part_number,
             qty=qty_out,
-            before_total_add=before_add,
-            after_total_add=after_add,
-            before_total_used=before_used,
-            after_total_used=after_used,
+            before_total_add=before_qty,
+            after_total_add=after_qty,
+            before_total_used=before_out,
+            after_total_used=after_out,
             performed_by=performed_by,
             source="Stock IN/OUT",
             note=note,
@@ -357,7 +525,7 @@ def delete_part(part_number: str, performed_by: str = "", note: str = "") -> Non
         c = conn.cursor()
         c.execute(
             """
-            SELECT COALESCE(total_used, 0), COALESCE(total_add, 0)
+            SELECT COALESCE(total_in, 0), COALESCE(total_out, 0), COALESCE(total_quantity, 0)
             FROM storage
             WHERE part_number = ?
             LIMIT 1
@@ -368,8 +536,9 @@ def delete_part(part_number: str, performed_by: str = "", note: str = "") -> Non
         if not row:
             raise ValueError(f"Part not found: {pn}")
 
-        before_used = int(row[0])
-        before_add = int(row[1])
+        before_in = int(row[0])
+        before_out = int(row[1])
+        before_qty = int(row[2])
 
         c.execute("DELETE FROM storage WHERE part_number = ?", (pn,))
         if c.rowcount <= 0:
@@ -382,7 +551,28 @@ def delete_part(part_number: str, performed_by: str = "", note: str = "") -> Non
             part_number=pn,
             performed_by=performed_by,
             note=note,
-            before_state=before_state,
+            # DELETE: keep key fields so audit shows what was removed.
+            before_state=(
+                {
+                    k: (before_state or {}).get(k, "")
+                    for k in [
+                        "part_number",
+                        "part_type",
+                        "item_name",
+                        "brand",
+                        "model",
+                        "specification",
+                        "preferred_supplier",
+                        "item_cost_rm",
+                        "usage_area",
+                        "total_quantity",
+                        "total_in",
+                        "total_out",
+                    ]
+                }
+                if before_state
+                else None
+            ),
             after_state=None,
         )
 
@@ -390,9 +580,9 @@ def delete_part(part_number: str, performed_by: str = "", note: str = "") -> Non
             action="DELETE",
             part_number=pn,
             qty=0,
-            before_total_add=before_add,
+            before_total_add=before_qty,
             after_total_add=0,
-            before_total_used=before_used,
+            before_total_used=before_out,
             after_total_used=0,
             performed_by=performed_by,
             source="Stock IN/OUT",
@@ -470,13 +660,15 @@ def update_storage_row_allow_renumber(
     new_part_number: str,
     item_name: str,
     specification: str,
-    total_add: int,
-    total_used: int,
     part_type: str,
-    usage: str,
+    usage_area: str,
+    total_quantity: int,
+    total_out: int,
     *,
     brand: str = "",
     model: str = "",
+    preferred_supplier: str = "",
+    item_cost_rm: float = 0.0,
     performed_by: str = "",
     note: str = "",
 ) -> None:
@@ -487,9 +679,11 @@ def update_storage_row_allow_renumber(
     if not new_pn:
         raise ValueError("New Part Number is required")
 
-    total_add = int(total_add)
-    total_used = int(total_used)
-    total_quantity = total_used + total_add
+    total_quantity = int(total_quantity)
+    total_out = int(total_out)
+    if total_quantity < 0 or total_out < 0:
+        raise ValueError("Quantities cannot be negative")
+    total_in = total_out + total_quantity
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -504,11 +698,13 @@ def update_storage_row_allow_renumber(
                 brand = ?,
                 model = ?,
                 specification = ?,
-                total_quantity = ?,
-                total_used = ?,
-                total_add = ?,
                 part_type = ?,
-                usage = ?
+                preferred_supplier = ?,
+                item_cost_rm = ?,
+                total_quantity = ?,
+                usage_area = ?,
+                total_in = ?,
+                total_out = ?
             WHERE part_number = ?
             """,
             (
@@ -517,11 +713,13 @@ def update_storage_row_allow_renumber(
                 str(brand or "").strip(),
                 str(model or "").strip(),
                 specification,
-                int(total_quantity),
-                int(total_used),
-                int(total_add),
                 str(part_type or "").strip(),
-                str(usage or "").strip(),
+                str(preferred_supplier or "").strip(),
+                float(item_cost_rm or 0.0),
+                int(total_quantity),
+                str(usage_area or "").strip(),
+                int(total_in),
+                int(total_out),
                 old_pn,
             ),
         )
@@ -532,6 +730,26 @@ def update_storage_row_allow_renumber(
 
         after_state = _fetch_storage_row(conn, new_pn)
 
+        # UPDATE/RENUMBER: only log the fields that changed
+        b_diff, a_diff = _diff_state_for_log(
+            before_state,
+            after_state,
+            include_keys=[
+                "part_number",
+                "part_type",
+                "item_name",
+                "brand",
+                "model",
+                "specification",
+                "preferred_supplier",
+                "item_cost_rm",
+                "usage_area",
+                "total_quantity",
+                "total_in",
+                "total_out",
+            ],
+        )
+
         action = "RENUMBER_PART" if old_pn != new_pn else "UPDATE_PART"
         extra = f"old_pn={old_pn}" if old_pn != new_pn else ""
         combined_note = (str(note or "").strip() + (" | " + extra if extra else "")).strip(" |")
@@ -541,8 +759,8 @@ def update_storage_row_allow_renumber(
             part_number=new_pn,
             performed_by=performed_by,
             note=combined_note,
-            before_state=before_state,
-            after_state=after_state,
+            before_state=b_diff,
+            after_state=a_diff,
         )
 
         try:
@@ -584,22 +802,39 @@ if st.session_state.show_add_part:
     with col_item:
         add_item_name = st.text_input("Item Name", key="add_item_name")
     with col_qty:
-        add_total_qty = st.number_input("Total Quantity", min_value=0, step=1, key="add_total_qty")
+        add_total_qty = st.number_input(
+            "Total Quantity (Available)",
+            min_value=0,
+            step=1,
+            key="add_total_qty",
+        )
 
-    col_brand, col_model = st.columns([1, 1])
-    with col_brand:
-        add_brand = st.text_input("Brand", key="add_brand")
+    col_model, col_brand = st.columns([1, 1])
     with col_model:
         add_model = st.text_input("Model", key="add_model")
+    with col_brand:
+        add_brand = st.text_input("Brand", key="add_brand")
+
+    col_supplier, col_cost = st.columns([2, 1])
+    with col_supplier:
+        add_supplier = st.text_input("Preferred Supplier", key="add_supplier")
+    with col_cost:
+        add_item_cost = st.number_input(
+            "Item Cost (RM)",
+            min_value=0.0,
+            step=0.10,
+            format="%.2f",
+            key="add_item_cost_rm",
+        )
 
     col_spec, col_usage = st.columns([2, 1])
     with col_spec:
         add_specification = st.text_input("Item Specification", key="add_spec")
     with col_usage:
         add_usage = st.text_input(
-            "Usage (Equipment/Machine/Jig/Fixture/Tester)",
+            "Usage Area",
             key="add_usage",
-            placeholder="Enter usage (free text)",
+            placeholder="Enter usage area (free text)",
         )
 
     if st.button("💾 Save Part"):
@@ -611,11 +846,13 @@ if st.session_state.show_add_part:
                     part_number=auto_pn,
                     item_name=add_item_name.strip(),
                     specification=add_specification.strip(),
-                    total_add=int(add_total_qty),
                     part_type=PART_TYPE_CONFIG[add_part_type_label]["type_code"],
-                    usage=str(add_usage or "").strip(),
+                    usage_area=str(add_usage or "").strip(),
+                    total_quantity=int(add_total_qty),
                     brand=str(add_brand or "").strip(),
                     model=str(add_model or "").strip(),
+                    preferred_supplier=str(add_supplier or "").strip(),
+                    item_cost_rm=float(add_item_cost or 0.0),
                     performed_by=_performed_by_label(),
                     note="Add New Part",
                 )
@@ -640,12 +877,12 @@ else:
         st.info("No parts in storage yet.")
     else:
         storage_df = storage_df.copy()
-        storage_df["available"] = storage_df["total_add"].fillna(0).astype(int)
+        storage_df["available"] = storage_df["total_quantity"].fillna(0).astype(int)
 
         c_f1, c_f2 = st.columns([2, 1])
         with c_f1:
             existing_search = st.text_input(
-                "Search parts (Part Number / Item Name / Brand / Model / Specification)",
+                "Search parts (Part Number / Part Type / Item Name / Model / Brand / Specification / Supplier / Usage Area)",
                 key="existing_parts_search",
                 placeholder="Type to filter...",
             ).strip()
@@ -667,15 +904,46 @@ else:
             brand_match = filtered_df.get("brand", "").astype(str).str.contains(existing_search, case=False, na=False)
             model_match = filtered_df.get("model", "").astype(str).str.contains(existing_search, case=False, na=False)
             spec_match = filtered_df.get("specification", "").astype(str).str.contains(existing_search, case=False, na=False)
-            filtered_df = filtered_df[pn_match | name_match | brand_match | model_match | spec_match]
+            supp_match = filtered_df.get("preferred_supplier", "").astype(str).str.contains(existing_search, case=False, na=False)
+            usage_match = filtered_df.get("usage_area", "").astype(str).str.contains(existing_search, case=False, na=False)
+            filtered_df = filtered_df[pn_match | name_match | brand_match | model_match | spec_match | supp_match | usage_match]
 
-        show_cols = ["part_number", "item_name", "brand", "model", "specification", "part_type", "usage", "available"]
+        show_cols = [
+            "part_number",
+            "part_type",
+            "item_name",
+            "model",
+            "brand",
+            "specification",
+            "preferred_supplier",
+            "item_cost_rm",
+            "total_quantity",
+            "usage_area",
+            "total_in",
+            "total_out",
+        ]
         for c in show_cols:
             if c not in filtered_df.columns:
                 filtered_df[c] = ""
 
         st.caption(f"Showing {len(filtered_df)} of {len(storage_df)} parts")
-        st.dataframe(filtered_df[show_cols], use_container_width=True, hide_index=True)
+        display_df = filtered_df[show_cols].copy().rename(
+            columns={
+                "part_number": "Part Number",
+                "part_type": "Part Type",
+                "item_name": "Item Name",
+                "model": "Model",
+                "brand": "Brand",
+                "specification": "Specification",
+                "preferred_supplier": "Preferred Supplier",
+                "item_cost_rm": "Item Cost (RM)",
+                "total_quantity": "Total Quantity",
+                "usage_area": "Usage Area",
+                "total_in": "Total In",
+                "total_out": "Total Out",
+            }
+        )
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.markdown("#### 🔁 Stock IN / OUT")
@@ -738,12 +1006,18 @@ with st.expander("Open Stock IN/OUT", expanded=False):
             out_pn = option_to_pn[out_opt]
 
             try:
-                avail = int(storage_df.loc[storage_df["part_number"] == out_pn, "total_add"].iloc[0])
+                avail = int(storage_df.loc[storage_df["part_number"] == out_pn, "total_quantity"].iloc[0])
             except Exception:
                 avail = 0
-            st.caption(f"Available (total_add): {avail}")
+            st.caption(f"Available: {avail}")
 
             out_qty = st.number_input("Qty OUT", min_value=1, step=1, key="stock_out_qty")
+
+            out_requestor = st.text_input(
+                "Requestor (required)",
+                key="stock_out_requestor",
+                placeholder="Name / Department / Line...",
+            )
 
             out_desc = st.text_input(
                 "Description (required)",
@@ -752,11 +1026,15 @@ with st.expander("Open Stock IN/OUT", expanded=False):
             )
 
             if st.button("✅ Apply OUT", key="btn_apply_out"):
+                if not out_requestor.strip():
+                    st.error("Requestor is required for Stock OUT.")
+                    st.stop()
                 if not out_desc.strip():
                     st.error("Description is required for Stock OUT.")
                     st.stop()
                 try:
-                    stock_out_adjust(out_pn, int(out_qty), performed_by=_performed_by_label(), note=out_desc.strip())
+                    note = f"Requestor={out_requestor.strip()} | {out_desc.strip()}"
+                    stock_out_adjust(out_pn, int(out_qty), performed_by=_performed_by_label(), note=note)
                     st.success("Stock OUT applied.")
                     st.rerun()
                 except Exception as e:
@@ -775,9 +1053,7 @@ with st.expander("Open editor", expanded=False):
         if df_edit.empty:
             st.info("No parts in storage.")
         else:
-            df_edit["total_quantity"] = (
-                df_edit["total_used"].astype(int) + df_edit["total_add"].astype(int)
-            ).astype(int)
+            df_edit["total_in"] = (df_edit["total_out"].astype(int) + df_edit["total_quantity"].astype(int)).astype(int)
             df_edit["Remove"] = False
 
             edited = st.data_editor(
@@ -785,30 +1061,33 @@ with st.expander("Open editor", expanded=False):
                     [
                         "Remove",
                         "part_number",
-                        "item_name",
-                        "brand",
                         "model",
-                        "specification",
-                        "total_add",
-                        "total_used",
-                        "total_quantity",
+                        "brand",
                         "part_type",
-                        "usage",
+                        "item_name",
+                        "specification",
+                        "preferred_supplier",
+                        "item_cost_rm",
+                        "usage_area",
+                        "total_quantity",
+                        "total_out",
+                        "total_in",
                     ]
                 ],
                 hide_index=True,
                 use_container_width=True,
-                disabled=["part_number", "total_quantity"],
+                disabled=["part_number", "total_in"],
                 column_config={
                     "Remove": st.column_config.CheckboxColumn("Remove", default=False),
-                    "total_add": st.column_config.NumberColumn("Total Quantity (Available)", min_value=0, step=1),
-                    "total_used": st.column_config.NumberColumn("Total Used", min_value=0, step=1),
+                    "item_cost_rm": st.column_config.NumberColumn("Item Cost (RM)", min_value=0.0, step=0.1, format="%.2f"),
+                    "total_quantity": st.column_config.NumberColumn("Total Quantity (Available)", min_value=0, step=1),
+                    "total_out": st.column_config.NumberColumn("Total Out", min_value=0, step=1),
                     "part_type": st.column_config.SelectboxColumn(
                         "Part Type",
                         options=[cfg["type_code"] for cfg in PART_TYPE_CONFIG.values()],
                         required=False,
                     ),
-                    "usage": st.column_config.TextColumn("Usage (free text)"),
+                    "usage_area": st.column_config.TextColumn("Usage Area"),
                 },
                 key="storage_table_editor",
             )
@@ -827,6 +1106,21 @@ with st.expander("Open editor", expanded=False):
                 errors: list[str] = []
                 reserved_pns: set[str] = set()
 
+                def _norm_text(v: object) -> str:
+                    return str(v or "").strip()
+
+                def _norm_int(v: object) -> int:
+                    try:
+                        return int(pd.to_numeric(v, errors="coerce") or 0)
+                    except Exception:
+                        return 0
+
+                def _norm_float2(v: object) -> float:
+                    try:
+                        return round(float(pd.to_numeric(v, errors="coerce") or 0.0), 2)
+                    except Exception:
+                        return 0.0
+
                 # apply updates for rows not marked for delete
                 for _, r in edited.iterrows():
                     pn = str(r["part_number"]).strip()
@@ -838,9 +1132,11 @@ with st.expander("Open editor", expanded=False):
                         model = str(r.get("model", "")).strip()
                         spec = str(r["specification"]).strip()
                         ptype = str(r["part_type"]).strip()
-                        usage = str(r.get("usage", "")).strip()
-                        total_add = int(pd.to_numeric(r["total_add"], errors="coerce"))
-                        total_used = int(pd.to_numeric(r["total_used"], errors="coerce"))
+                        usage_area = str(r.get("usage_area", "")).strip()
+                        supplier = str(r.get("preferred_supplier", "")).strip()
+                        item_cost_rm = float(pd.to_numeric(r.get("item_cost_rm", 0.0), errors="coerce") or 0.0)
+                        total_quantity = int(pd.to_numeric(r["total_quantity"], errors="coerce"))
+                        total_out = int(pd.to_numeric(r["total_out"], errors="coerce"))
 
                         if not pn:
                             errors.append("Row has empty part_number (cannot update).")
@@ -848,7 +1144,7 @@ with st.expander("Open editor", expanded=False):
                         if not item:
                             errors.append(f"{pn}: Item Name is required.")
                             continue
-                        if total_add < 0 or total_used < 0:
+                        if total_quantity < 0 or total_out < 0:
                             errors.append(f"{pn}: quantities cannot be negative.")
                             continue
 
@@ -863,6 +1159,32 @@ with st.expander("Open editor", expanded=False):
                         except Exception:
                             before_state = {}
 
+                        # Only log/update if something actually changed.
+                        before_item = _norm_text(before_state.get("item_name"))
+                        before_brand = _norm_text(before_state.get("brand"))
+                        before_model = _norm_text(before_state.get("model"))
+                        before_spec = _norm_text(before_state.get("specification"))
+                        before_ptype = _norm_text(before_state.get("part_type"))
+                        before_usage = _norm_text(before_state.get("usage_area") or before_state.get("usage"))
+                        before_supplier = _norm_text(before_state.get("preferred_supplier"))
+                        before_cost = _norm_float2(before_state.get("item_cost_rm"))
+                        before_qty = _norm_int(before_state.get("total_quantity"))
+                        before_out = _norm_int(before_state.get("total_out"))
+
+                        after_cost = _norm_float2(item_cost_rm)
+                        changed_fields = (
+                            item != before_item
+                            or brand != before_brand
+                            or model != before_model
+                            or spec != before_spec
+                            or ptype != before_ptype
+                            or usage_area != before_usage
+                            or supplier != before_supplier
+                            or after_cost != before_cost
+                            or int(total_quantity) != int(before_qty)
+                            or int(total_out) != int(before_out)
+                        )
+
                         old_type = str(before_state.get("part_type", "") or "").strip()
                         if old_type and ptype and old_type != ptype:
                             pn_prefix = TYPE_CODE_TO_PN_PREFIX.get(ptype)
@@ -874,17 +1196,23 @@ with st.expander("Open editor", expanded=False):
                             )
                             reserved_pns.add(desired_pn)
 
+                        # If nothing changed and no renumber, skip update/log.
+                        if not changed_fields and desired_pn == pn:
+                            continue
+
                         update_storage_row_allow_renumber(
                             pn,
                             desired_pn,
                             item,
                             spec,
-                            total_add,
-                            total_used,
                             ptype,
-                            usage,
+                            usage_area,
+                            total_quantity,
+                            total_out,
                             brand=brand,
                             model=model,
+                            preferred_supplier=supplier,
+                            item_cost_rm=item_cost_rm,
                             performed_by=_performed_by_label(),
                             note="Storage Editor",
                         )
@@ -933,7 +1261,7 @@ if st.session_state.get("show_inventory_history", False):
         conn = sqlite3.connect(DB_PATH)
         try:
             hist_df = pd.read_sql(
-                "SELECT timestamp, action, part_number, note, performed_by "
+                "SELECT id, timestamp, action, part_number, performed_by, note, before_state, after_state "
                 "FROM inventory_history ORDER BY id DESC LIMIT 200",
                 conn,
             )
@@ -943,14 +1271,17 @@ if st.session_state.get("show_inventory_history", False):
         if hist_df is not None and not hist_df.empty:
             display_hist = hist_df.copy().rename(
                 columns={
+                    "id": "Id",
                     "timestamp": "📅 Timestamp",
-                    "action": "🔄 Action",
-                    "part_number": "🔧 Part Number",
-                    "note": "📄 Details",
-                    "performed_by": "👤 User",
+                    "action": "Action",
+                    "part_number": "Part number",
+                    "performed_by": "Performed by",
+                    "note": "Note",
+                    "before_state": "Before state",
+                    "after_state": "After state",
                 }
             )
-            st.dataframe(display_hist, use_container_width=True)
+            st.dataframe(display_hist, use_container_width=True, hide_index=True)
         else:
             st.info("📝 No inventory history entries yet.")
     except Exception as e:
