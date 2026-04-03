@@ -30,7 +30,7 @@ DATA_DIR = APP_ROOT / "data"
 MAIN_DB_FILE = DATA_DIR / "main_data.db"
 
 # Optional Git-friendly exports (useful for backups / PR reviews)
-ASSET_EXPORT_CSV = DATA_DIR / "assets_export.csv"
+# ASSET_EXPORT_CSV = DATA_DIR / "assets_export.csv"
 
 # Legacy DBs (migration only)
 LEGACY_LOG_DB_FILE = DATA_DIR / "asset_log.db"
@@ -996,10 +996,10 @@ def get_next_department_id(dept_code: str, item_prefix: str) -> str:
 def _migrate_legacy_into_main_db() -> None:
     """One-time best-effort migration into main_data.db.
 
-    - If asset table is empty, import from CSV.
-    - If log/workshop tables are empty, copy from legacy DBs (if present).
+    - Copy from legacy DBs if tables are empty.
     """
     _ensure_tables_in_main_db()
+
     def _copy_table_if_dest_empty(dest_conn: sqlite3.Connection, *, src_db: Path, table: str) -> None:
         if not src_db.exists():
             return
@@ -1008,11 +1008,9 @@ def _migrate_legacy_into_main_db() -> None:
         if _table_row_count(dest_conn, table) > 0:
             return
 
+        src_conn = None
         try:
             src_conn = sqlite3.connect(src_db)
-        except Exception:
-            return
-        try:
             if not _table_exists(src_conn, table):
                 return
             df_src = pd.read_sql_query(f'SELECT * FROM "{table}"', src_conn)
@@ -1074,12 +1072,25 @@ def _migrate_legacy_into_main_db() -> None:
             # Append into existing dest table
             df_src.to_sql(table, dest_conn, if_exists="append", index=False)
         except Exception:
-            return
+            pass  # Best-effort
         finally:
-            try:
-                src_conn.close()
-            except Exception:
-                pass
+            if src_conn:
+                try:
+                    src_conn.close()
+                except Exception:
+                    pass
+
+    conn = _connect_main_db()
+    try:
+        # Legacy DBs -> main DB (best-effort, only if dest empty)
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_LOG_DB_FILE, table="asset_logs")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_LOG_DB_FILE, table="stock_log")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_WORKSHOP_DB_FILE, table="storage")
+        _copy_table_if_dest_empty(conn, src_db=LEGACY_WORKSHOP_DB_FILE, table="task_reports")
+
+        conn.commit()
+    finally:
+        conn.close()
 
     conn = _connect_main_db()
     try:
@@ -1217,6 +1228,10 @@ def _load_existing_data_cached(_day_key: str) -> Optional[pd.DataFrame]:
             if col not in df.columns:
                 df[col] = None
 
+        # Convert Day Left to numeric to handle any string values from DB
+        if "Day Left" in df.columns:
+            df["Day Left"] = pd.to_numeric(df["Day Left"], errors="coerce")
+
         # Keep derived fields consistent (Day Left / Status can become stale over time).
         # Avoid DataFrame truthiness ("truth value of a DataFrame is ambiguous").
         fixed_df = recompute_asset_derived_fields(df)
@@ -1265,14 +1280,14 @@ def save_data(df: pd.DataFrame) -> bool:
             conn.close()
 
         # Git-friendly export (best-effort)
-        try:
-            ensure_data_directory()
-            export_df = df.copy()
-            ordered = [c for c in REQUIRED_COLUMNS if c in export_df.columns] + [c for c in export_df.columns if c not in REQUIRED_COLUMNS]
-            export_df = export_df[ordered]
-            export_df.to_csv(ASSET_EXPORT_CSV, index=False)
-        except Exception:
-            pass
+        # try:
+        #     ensure_data_directory()
+        #     export_df = df.copy()
+        #     ordered = [c for c in REQUIRED_COLUMNS if c in export_df.columns] + [c for c in export_df.columns if c not in REQUIRED_COLUMNS]
+        #     export_df = export_df[ordered]
+        #     export_df.to_csv(ASSET_EXPORT_CSV, index=False)
+        # except Exception:
+        #     pass
 
         try:
             _load_existing_data_cached.clear()
@@ -1280,7 +1295,7 @@ def save_data(df: pd.DataFrame) -> bool:
             pass
 
         try:
-            persist_repo_changes([str(MAIN_DB_FILE), str(ASSET_EXPORT_CSV)], reason="Update assets")
+            persist_repo_changes([str(MAIN_DB_FILE)], reason="Update assets")
         except Exception:
             pass
         return True
@@ -1487,8 +1502,8 @@ def recompute_asset_derived_fields(df: Optional[pd.DataFrame]) -> Optional[pd.Da
             days_left = calculate_days_left(due_dt) if due_dt else None
         except Exception:
             days_left = None
-        if days_left is not None:
-            out.at[idx, "Day Left"] = days_left
+        # Always set Day Left, even if None, to ensure consistent typing
+        out.at[idx, "Day Left"] = days_left
 
         # Status (computed)
         # Apply Expired/Expired Soon when Day Left is known; otherwise fall back to location-based Good/Idle.
