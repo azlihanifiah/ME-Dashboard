@@ -1186,9 +1186,13 @@ def get_asset_logs(limit: int = 100) -> Optional[pd.DataFrame]:
         return None
 
 def _cache_key_sg_day() -> str:
-    # Used to make cache refresh at Singapore midnight.
+    # Used to make cache refresh at Singapore midnight and when DB changes.
     try:
-        return today_sg().isoformat()
+        day_key = today_sg().isoformat()
+        if MAIN_DB_FILE.exists():
+            mtime = MAIN_DB_FILE.stat().st_mtime
+            return f"{day_key}_{mtime}"
+        return day_key
     except Exception:
         return str(date.today().isoformat())
 
